@@ -1,0 +1,59 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+
+
+# Environment variables (API keys)
+.env
+.env.*
+!.env.example
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# ChromaDB (local vector database)
+chroma_db/
+
+# Data files (scraped papers, etc.)
+data/
+
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Gradio
+*.gradio/
+gradio_cached_examples/
+
+# Docker
+.dockerignore
+
+# Logs
+*.log
+logs/
+
+# Python type stubs
+*.pyi
