@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
 
@@ -48,12 +49,10 @@ class Settings:
     postgres_password: str = env("POSTGRES_PASSWORD", "papermind")
 
     @property
-    def postgres_dsn(self) -> str:
-        """按 psycopg 接受的格式生成 PostgreSQL 连接字符串。"""
+    def postgres_url(self) -> str:
+        """生成 SQLAlchemy 使用的 PostgreSQL 数据库 URL。"""
         return (
-            f"host={self.postgres_host} "
-            f"port={self.postgres_port} "
-            f"dbname={self.postgres_db} "
-            f"user={self.postgres_user} "
-            f"password={self.postgres_password}"
+            "postgresql+psycopg://"
+            f"{quote_plus(self.postgres_user)}:{quote_plus(self.postgres_password)}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
