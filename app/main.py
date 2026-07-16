@@ -68,7 +68,6 @@ async def build_index() -> IndexResponse:
 async def search(request: SearchRequest) -> SearchResponse:
     """执行向量检索
 
-    :param request: _description_
     :return: 最多 ``top_k``条相关文本块
     """
     results = await retriever.retrieve(request.query, request.top_k)
