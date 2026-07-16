@@ -5,8 +5,12 @@ from app.chunker import build_chunks
 from app.collector import collect_arxiv
 from app.config import Settings
 from app.embeddings import create_embedding_client
+from app.llm import create_llm_client
+from app.rag import RAGService
 from app.retriever import Retriever
 from app.schemas import (
+    AskRequest,
+    AskResponse,
     CollectRequest,
     CollectResponse,
     IndexResponse,
@@ -23,6 +27,8 @@ storage = create_storage(settings)
 embedding_client = create_embedding_client(settings)
 vector_store = ChromaVectorStore(settings.chroma_host, settings.chroma_port, settings.collection_name)
 retriever = Retriever(vector_store, embedding_client)
+llm_client = create_llm_client(settings)
+rag_service = RAGService(retriever, llm_client)
 
 
 app = FastAPI(title="PaperMind", version="0.1.0")
@@ -68,6 +74,14 @@ async def search(request: SearchRequest) -> SearchResponse:
     results = await retriever.retrieve(request.query, request.top_k)
     return SearchResponse(results=results)
 
+
+@app.post("/ask", response_model=AskResponse)
+async def ask(request: AskRequest) -> AskResponse:
+    """接收用户问题，并通过 RAG 服务返回回答与引用来源
+
+    :return: RAG 服务生成的回答和来源列表
+    """
+    return await rag_service.ask(request.question, request.top_k)
 
 class Item(BaseModel):
     name: str
