@@ -1,14 +1,28 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from app.chunker import build_chunks
 from app.collector import collect_arxiv
 from app.config import Settings
-from app.schemas import CollectRequest, CollectResponse
+from app.embeddings import create_embedding_client
+from app.retriever import Retriever
+from app.schemas import (
+    CollectRequest,
+    CollectResponse,
+    IndexResponse,
+    SearchRequest,
+    SearchResponse,
+    )
 from app.storage import create_storage
+from app.vector_store import ChromaVectorStore
 
 
+# 在应用启动时装配存储、Embedding、向量库与检索器依赖
 settings = Settings()
 storage = create_storage(settings)
+embedding_client = create_embedding_client(settings)
+vector_store = ChromaVectorStore(settings.chroma_host, settings.chroma_port, settings.collection_name)
+retriever = Retriever(vector_store, embedding_client)
 
 
 app = FastAPI(title="PaperMind", version="0.1.0")
@@ -29,6 +43,30 @@ async def collect_papers(request: CollectRequest) -> CollectResponse:
         raise HTTPException(status_code=502, detail=f"paper collection failed: {exc}") from exc
     storage.save_many(papers)
     return CollectResponse(count=len(papers), papers=papers)
+
+
+@app.post("/index/build", response_model=IndexResponse)
+async def build_index() -> IndexResponse:
+    """读取论文并创建 ChromaDB 向量索引
+
+    :return: 被处理的论文数和写入的文本块数
+    """
+    papers = storage.load_all()
+    chunks = build_chunks(papers)
+    embeddings = await embedding_client.embed_texts([chunk.text for chunk in chunks])
+    vector_store .upsert_chunks(chunks, embeddings)
+    return IndexResponse(papers=len(papers), chunks=len(chunks))
+
+
+@app.post("/search", response_model=SearchResponse)
+async def search(request: SearchRequest) -> SearchResponse:
+    """执行向量检索
+
+    :param request: _description_
+    :return: 最多 ``top_k``条相关文本块
+    """
+    results = await retriever.retrieve(request.query, request.top_k)
+    return SearchResponse(results=results)
 
 
 class Item(BaseModel):
