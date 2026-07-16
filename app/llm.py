@@ -59,7 +59,7 @@ class OpenAICompatibleLLMClient(BaseLLMClient):
         prompt = build_rag_prompt(question, contexts)
         payload = {
             "model": self.model,
-            "message": [
+            "messages": [
                 {"role": "system", "content": "你是一个严谨的论文阅读助手"},
                 {"role": "user", "content": prompt},
             ],
