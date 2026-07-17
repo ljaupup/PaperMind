@@ -57,3 +57,5 @@ logs/
 
 # Python type stubs
 *.pyi
+
+tmp/
