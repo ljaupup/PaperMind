@@ -1,0 +1,4 @@
+# 保留可复现的测试源码，只忽略 Python 运行产物。
+__pycache__/
+*.py[oc]
+.pytest_cache/

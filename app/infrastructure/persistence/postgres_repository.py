@@ -2,12 +2,12 @@ from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.db.database import init_db
-from app.db.models import PaperRecord
-from app.schemas import Paper
+from app.domain.models import Paper
+from app.infrastructure.persistence.database import init_db
+from app.infrastructure.persistence.models import PaperRecord
 
 
-class PostgresPaperStorage:
+class PostgresPaperRepository:
     """以 SQLAlchemy ORM 实现 PostgreSQL 论文存储。"""
 
     def __init__(self, database_url: str) -> None:

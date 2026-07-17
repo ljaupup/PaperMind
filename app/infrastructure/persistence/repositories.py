@@ -1,26 +1,14 @@
 import json
 from pathlib import Path
-from typing import Protocol
 
-from app.config import Settings
-from app.db.repositories import PostgresPaperStorage
-from app.schemas import Paper
-
-
-class PaperStorage(Protocol):
-    """存储层契约：调用方只依赖读写论文的能力，不依赖具体介质。"""
-
-    def load_all(self) -> list[Paper]:
-        """读取当前后端中的全部论文。"""
-        ...
-
-    def save_many(self, papers: list[Paper]) -> list[Paper]:
-        """按 paper_id 保存或更新论文，并返回保存后的全部论文。"""
-        ...
+from app.core.config import Settings
+from app.domain.models import Paper
+from app.domain.ports import PaperRepository
+from app.infrastructure.persistence.postgres_repository import PostgresPaperRepository
 
 
-class LocalPaperStorage:
-    """以 JSON 文件实现 PaperStorage，适合本地开发和调试。"""
+class LocalPaperRepository:
+    """以 JSON 文件实现论文仓储，适合本地开发和调试。"""
 
     def __init__(self, path: Path) -> None:
         """初始化数据文件路径，并确保其父目录存在。"""
@@ -48,8 +36,8 @@ class LocalPaperStorage:
         return all_papers
 
 
-def create_storage(settings: Settings) -> PaperStorage:
-    """根据配置选择本地 JSON 或 PostgreSQL 存储实现。"""
+def create_paper_repository(settings: Settings) -> PaperRepository:
+    """根据配置选择本地 JSON 或 PostgreSQL 论文仓储实现。"""
     if settings.storage_backend == "postgres":
-        return PostgresPaperStorage(settings.postgres_url)
-    return LocalPaperStorage(settings.papers_file)
+        return PostgresPaperRepository(settings.postgres_url)
+    return LocalPaperRepository(settings.papers_file)

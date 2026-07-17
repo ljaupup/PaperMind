@@ -2,7 +2,7 @@ import time
 
 import chromadb
 
-from app.schemas import PaperChunk, SearchResult
+from app.domain.models import PaperChunk, SearchResult
 
 class ChromaVectorStore:
     """ChromaDB Server 的访问封装，负责向量写入与相似度查询"""
@@ -23,7 +23,7 @@ class ChromaVectorStore:
             except Exception as exc:
                 last_error = exc
                 time.sleep(1)
-            raise RuntimeError(f"failed to connect chromadb server: {last_error}")
+        raise RuntimeError(f"failed to connect chromadb server: {last_error}")
 
     def upsert_chunks(self, chunks: list[PaperChunk], embeddings: list[list[float]]) -> None:
         """将文本块、向量和来源元数据按照 chunk_id 幂等写入 ChromaDB

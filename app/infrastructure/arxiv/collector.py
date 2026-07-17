@@ -1,8 +1,8 @@
+import asyncio
+
 import arxiv
 
-from app.schemas import Paper
-
-import asyncio
+from app.domain.models import Paper
 
 
 # 复用客户端，并显示限制请求频率和重试次数，避免短时间连续请求 arXiv

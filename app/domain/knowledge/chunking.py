@@ -1,4 +1,4 @@
-from app.schemas import Paper, PaperChunk
+from app.domain.models import Paper, PaperChunk
 
 def chunk_text(text: str, chunk_size: int = 700, overlap: int = 120) -> list[str]:
     """将规范化文本按固定长度切块，并保留相邻块的重叠内容"""

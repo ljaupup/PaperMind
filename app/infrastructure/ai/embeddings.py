@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 
 import httpx
 
-from app.config import Settings
+from app.core.config import Settings
 
 
 class BaseEmbeddingClient(ABC):

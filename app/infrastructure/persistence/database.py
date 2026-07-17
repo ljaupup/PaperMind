@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 
-from app.db.models import Base
+from app.infrastructure.persistence.models import Base
 
 
 def init_db(database_url: str) -> Engine:

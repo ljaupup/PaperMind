@@ -1,15 +1,14 @@
-from app.embeddings import BaseEmbeddingClient
-from app.schemas import SearchResult
-from app.vector_store import ChromaVectorStore
+from app.domain.models import SearchResult
+from app.domain.ports import EmbeddingClient, VectorStore
 
-class Retriever:
+class RetrievalService:
     """协调 Embedding 与向量库，将用户查询转换为 Top-K 检索结果"""
 
     def __init__(
-            self,
-            vector_store: ChromaVectorStore,
-            embedding_client: BaseEmbeddingClient
-            ) -> None:
+        self,
+        vector_store: VectorStore,
+        embedding_client: EmbeddingClient,
+    ) -> None:
         """注入向量库和 Embedding Provider
 
         :param vector_store: 提取向量查询能力的存储对象
