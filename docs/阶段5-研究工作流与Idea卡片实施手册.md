@@ -866,7 +866,13 @@ from app.domain.comparisons.models import ComparisonResult
 
 
 def parse_comparison(raw: str, allowed_chunk_ids: set[str]) -> ComparisonResult:
-    """Validate LLM JSON and make every unsupported claim visibly uncertain."""
+    """校验模型 JSON，并标记无证据的比较结论。
+
+    :param raw: 模型返回的 JSON 字符串。
+    :param allowed_chunk_ids: 当前专题允许引用的全文片段 ID。
+    :return: 校验并标记后的比较结果。
+    :raises ValueError: JSON 或来源引用不符合约束时抛出。
+    """
     try:
         result = ComparisonResult.model_validate(json.loads(raw))
     except (json.JSONDecodeError, ValidationError) as exc:
@@ -1268,7 +1274,7 @@ tests/api/test_ideas.py
 tests/integration/test_research_repositories.py
 ```
 
-这些脚本必须覆盖笔记刷新后仍存在、比较来源只能来自选定专题、Idea 状态不能跳跃、跨专题 Chunk 不能作为证据、删除笔记不删除 Paper。运行：
+这些脚本必须覆盖笔记刷新后仍存在、比较来源只能来自选定专题、Idea 状态不能跳跃、跨专题 Chunk 不能作为证据、删除笔记不删除 Paper。前置条件：本节列出的 Service、Router 和 Fake 测试文件均已保存；该命令不运行 integration 测试。满足后运行：
 
 ```bash
 uv run pytest tests/unit/test_note_service.py tests/unit/test_comparison_service.py tests/unit/test_idea_service.py tests/api/test_notes.py tests/api/test_comparisons.py tests/api/test_ideas.py -q
@@ -1356,6 +1362,15 @@ class NoteResponse(BaseModel):
     tags: list[str]
     created_at: datetime
     updated_at: datetime
+
+    @classmethod
+    def from_domain(cls, item) -> "NoteResponse":
+        """将领域对象或 ORM 记录转换为笔记响应。
+
+        :param item: 包含笔记响应字段的领域对象或 ORM 记录。
+        :return: 已完成类型校验的笔记响应。
+        """
+        return cls.model_validate(item, from_attributes=True)
 ```
 
 ```python
@@ -1364,7 +1379,11 @@ from uuid import UUID
 
 
 def normalize_tags(tags: list[str]) -> list[str]:
-    """Return stable, de-duplicated user tags."""
+    """返回稳定且去重后的用户标签。
+
+    :param tags: 用户输入的原始标签列表。
+    :return: 规范化、去重且保持输入顺序的标签列表。
+    """
     return list(dict.fromkeys(tag.strip().lower() for tag in tags if tag.strip()))
 
 
@@ -1793,6 +1812,15 @@ class IdeaResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
 
+    @classmethod
+    def from_domain(cls, item) -> "IdeaResponse":
+        """将领域对象或 ORM 记录转换为 Idea 响应。
+
+        :param item: 包含 Idea 响应字段的领域对象或 ORM 记录。
+        :return: 已完成类型校验的 Idea 响应。
+        """
+        return cls.model_validate(item, from_attributes=True)
+
 
 class IdeaEvidenceResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -2086,6 +2114,7 @@ from app.api.v1 import (
     collection,
     comparisons,
     documents,
+    health,
     ideas,
     index_jobs,
     indexing,
@@ -2106,6 +2135,7 @@ router.include_router(subscriptions.router)
 router.include_router(index_jobs.router)
 router.include_router(jobs.router)
 router.include_router(documents.router)
+router.include_router(health.router)
 router.include_router(search.router)
 router.include_router(notes.router)
 router.include_router(comparisons.router)
@@ -2128,7 +2158,8 @@ from app.application.index_job_service import IndexJobService
 from app.application.indexing_service import IndexingService
 from app.application.note_service import NoteService
 from app.application.rag_service import RAGService
-from app.application.retrieval_service import RetrievalService
+from app.application.hybrid_retrieval_service import HybridRetrievalService
+from app.application.reranking import ReciprocalRankReranker
 from app.application.subscription_scheduler import SubscriptionScheduler
 from app.application.subscription_service import SubscriptionService
 from app.application.topic_paper_service import TopicPaperService
@@ -2143,6 +2174,7 @@ from app.infrastructure.persistence.collection_job_repository import PostgresCol
 from app.infrastructure.persistence.database import session_factory
 from app.infrastructure.persistence.document_repository import PostgresChunkRepository, PostgresDocumentRepository
 from app.infrastructure.persistence.index_version_repository import PostgresIndexVersionRepository
+from app.infrastructure.persistence.keyword_searcher import PostgresKeywordSearcher
 from app.infrastructure.persistence.paper_repository import PostgresPaperRepository
 from app.infrastructure.persistence.research_repositories import (
     PostgresComparisonRepository,
@@ -2185,23 +2217,32 @@ class AppContainer:
         self.embeddings = create_embedding_client(settings)
         self.llm = create_llm_client(settings)
         self.vector_store = ChromaVectorStore(settings.chroma_host, settings.chroma_port, settings.collection_name)
+        self.keyword_searcher = PostgresKeywordSearcher(session_factory)
+        self.reranker = ReciprocalRankReranker()
         self.dispatcher = CeleryTaskDispatcher()
 
         self.topic_service = TopicService(self.topic_repository, DEFAULT_WORKSPACE_ID)
         self.topic_paper_service = TopicPaperService(self.topic_repository, self.paper_repository)
         self.collection_service = CollectionService(collect_arxiv, self.paper_repository)
         self.indexing_service = IndexingService(self.paper_repository, self.embeddings, self.vector_store)
-        self.retrieval_service = RetrievalService(
+        self.retrieval_service = HybridRetrievalService(
             self.embeddings,
             self.vector_store,
             self.index_version_repository,
+            self.keyword_searcher,
+            self.reranker,
         )
-        self.rag_service = RAGService(self.retrieval_service, self.llm)
+        self.rag_service = RAGService(
+            self.retrieval_service,
+            self.llm,
+            settings.rag_min_rerank_score,
+        )
         self.collection_job_service = CollectionJobService(self.collection_job_repository, self.dispatcher)
         self.collection_execution_service = CollectionExecutionService(
             self.collection_job_repository,
             self.topic_repository,
             self.paper_repository,
+            self.subscription_repository,
             collect_arxiv,
         )
         self.subscription_service = SubscriptionService(self.topic_repository, self.subscription_repository)
@@ -2263,6 +2304,11 @@ from app.core.logging import configure_logging
 
 
 def create_app(container: AppContainer | None = None) -> FastAPI:
+    """创建并配置 PaperMind V1.1 FastAPI 应用。
+
+    :param container: 可选的测试容器；缺失时创建生产容器。
+    :return: 已注册中间件、总路由和健康检查的应用。
+    """
     configure_logging()
     app = FastAPI(title="PaperMind", version="1.1.0")
     app.state.container = container or AppContainer()
@@ -2282,7 +2328,11 @@ def create_app(container: AppContainer | None = None) -> FastAPI:
 
     @app.get("/health", tags=["health"])
     def health() -> dict[str, str]:
-        return {"status": "ok", "version": "1.1.0"}
+        """返回不访问外部依赖的进程存活状态。
+
+        :return: 存活状态和当前应用版本。
+        """
+        return {"status": "ok", "version": app.version}
 
     return app
 
@@ -2594,10 +2644,11 @@ from app.infrastructure.persistence.topic_models import TopicRecord, TopicPaperR
 
 @pytest.mark.integration
 def test_note_and_idea_repositories_keep_topics_isolated() -> None:
-    """Run only against an empty, disposable PostgreSQL database."""
-    url = os.getenv("PAPER_MIND_TEST_POSTGRES_URL")
-    if not url:
-        pytest.skip("PAPER_MIND_TEST_POSTGRES_URL is required for integration tests")
+    """验证笔记和 Idea 仓储按专题隔离。
+
+    :return: None；断言仅在空的可丢弃 PostgreSQL 数据库中执行。
+    """
+    url = os.environ["PAPER_MIND_TEST_POSTGRES_URL"]
 
     engine = create_engine(url)
     Base.metadata.create_all(engine)
@@ -2728,7 +2779,7 @@ def test_idea_rejects_evidence_from_another_topic() -> None:
         service.add_evidence(idea.id, "foreign-chunk", EvidenceStance.SUPPORT, "not reusable")
 ```
 
-将代码保存为 `tests/unit/test_idea_service.py` 后运行：
+前置条件：将代码保存为 `tests/unit/test_idea_service.py`，并完成该测试导入的 Idea 领域模型和 Service。满足后运行：
 
 ```bash
 uv run pytest tests/unit/test_idea_service.py -q
@@ -2780,8 +2831,1260 @@ uv run pytest tests/unit/test_idea_service.py -q
 
 ## 补充：阅读进度与工作流收口
 
-阶段 1 已在 `TopicPaper` 中定义 `reading_status`；阶段 5 需要把它做成用户可见工作流，而不是只保存字段。论文详情页提供“未读、阅读中、已读、已归档”状态切换，专题页可按状态筛选并显示各状态数量。阅读笔记创建时默认关联当前论文和专题；若笔记引用全文证据，还应保存 `chunk_id` 与页码，便于从笔记回到原文。
+阶段 1 只保存收藏状态；本节在阶段 5 正式加入阅读进度。阅读状态属于“专题中的这篇论文”，同一篇全局论文在不同专题可以有不同状态。先完成数据库迁移，再改领域模型、Repository、Service、DTO、Router 和前端；迁移未执行前不能验证新字段。
 
-状态更新仍通过 `PATCH /api/v1/topics/{topic_id}/papers/{paper_id}`，而非另建不透明的“标记已读”动作接口。应用服务验证论文确实属于该专题，并拒绝非法状态；Repository 以专题论文唯一约束保证不会把状态写到别的专题。自动化测试覆盖状态筛选、跨专题隔离、阅读状态与收藏并存、删除笔记不影响论文或证据。
+### 领域与数据库增量
+
+用下面内容完整替换阶段 1 的 `app/domain/topics/models.py`：
+
+```python
+from datetime import datetime
+from enum import StrEnum
+from uuid import UUID, uuid4
+
+from pydantic import BaseModel, Field
+
+
+class ReadingStatus(StrEnum):
+    """定义专题论文的阅读进度。"""
+
+    UNREAD = "unread"
+    READING = "reading"
+    READ = "read"
+    ARCHIVED = "archived"
+
+
+class Topic(BaseModel):
+    """表示固定单用户工作区中的研究专题。"""
+
+    id: UUID = Field(default_factory=uuid4)
+    workspace_id: UUID
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=2000)
+    keywords: list[str] = Field(min_length=1)
+    categories: list[str] = Field(default_factory=list)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class TopicPaper(BaseModel):
+    """表示专题和全局论文之间的关联。"""
+
+    topic_id: UUID
+    paper_id: str
+    is_favorite: bool = False
+    reading_status: ReadingStatus = ReadingStatus.UNREAD
+    created_at: datetime | None = None
+
+
+class TopicPaperView(TopicPaper):
+    """表示包含论文展示字段的专题论文。"""
+
+    title: str
+    authors: list[str] = Field(default_factory=list)
+    url: str
+    pdf_url: str | None = None
+```
+
+用下面内容完整替换 `app/infrastructure/persistence/topic_models.py`：
+
+```python
+from datetime import datetime
+from uuid import UUID, uuid4
+
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, UUID as PG_UUID
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.infrastructure.persistence.models import Base
+
+
+class WorkspaceRecord(Base):
+    """将单用户工作区映射到 PostgreSQL。"""
+
+    __tablename__ = "workspaces"
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False, unique=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+
+
+class TopicRecord(Base):
+    """将研究专题映射到 PostgreSQL。"""
+
+    __tablename__ = "topics"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "name",
+            name="uq_topics_workspace_name",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid4,
+    )
+    workspace_id: Mapped[UUID] = mapped_column(
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    keywords: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=False)
+    categories: Mapped[list[str]] = mapped_column(
+        ARRAY(String),
+        nullable=False,
+        default=list,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class TopicPaperRecord(Base):
+    """将专题内论文状态映射到 PostgreSQL。"""
+
+    __tablename__ = "topic_papers"
+    __table_args__ = (
+        UniqueConstraint(
+            "topic_id",
+            "paper_id",
+            name="uq_topic_papers_topic_paper",
+        ),
+    )
+
+    topic_id: Mapped[UUID] = mapped_column(
+        ForeignKey("topics.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    paper_id: Mapped[str] = mapped_column(
+        ForeignKey("papers.paper_id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    is_favorite: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+    )
+    reading_status: Mapped[str] = mapped_column(
+        String(length=16),
+        nullable=False,
+        default="unread",
+        server_default="unread",
+        index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+```
+
+创建 `migrations/versions/0005_reading_status.py`。这是阶段 5 的第二个迁移，必须承接 `0004_research_workflow`：
+
+```python
+"""add topic paper reading status
+
+Revision ID: 0005_reading_status
+Revises: 0004_research_workflow
+"""
+
+from alembic import op
+import sqlalchemy as sa
+
+
+revision = "0005_reading_status"
+down_revision = "0004_research_workflow"
+branch_labels = None
+depends_on = None
+
+
+def upgrade() -> None:
+    """为专题论文增加非空阅读状态。
+
+    :return: None；既有记录统一初始化为未读。
+    """
+    op.add_column(
+        "topic_papers",
+        sa.Column("reading_status", sa.String(length=16), nullable=False, server_default="unread"),
+    )
+    op.create_index("ix_topic_papers_reading_status", "topic_papers", ["reading_status"])
+
+
+def downgrade() -> None:
+    """移除专题论文的阅读状态。
+
+    :return: None；回滚会丢弃所有阅读进度。
+    """
+    op.drop_index("ix_topic_papers_reading_status", table_name="topic_papers")
+    op.drop_column("topic_papers", "reading_status")
+```
+
+前置条件：`0001` 至 `0004` 已在可丢弃数据库成功应用，`migrations/env.py` 已导入 Topic ORM。满足后执行并检查迁移链：
+
+```bash
+uv run alembic upgrade head
+uv run alembic current
+```
+
+`current` 必须显示 `0005_reading_status (head)`。
+
+### Repository、Service 与 API 增量
+
+用下面内容完整替换 `app/domain/topics/ports.py`，使应用服务不依赖 PostgreSQL 具体类：
+
+```python
+from typing import Protocol
+from uuid import UUID
+
+from app.domain.models import Paper
+from app.domain.topics.models import (
+    ReadingStatus,
+    Topic,
+    TopicPaper,
+    TopicPaperView,
+)
+
+
+class TopicAlreadyExistsError(Exception):
+    """表示同一工作区内的专题名称重复。"""
+
+
+class TopicNotFoundError(Exception):
+    """表示请求的专题或专题论文关联不存在。"""
+
+
+class PaperNotFoundError(Exception):
+    """表示请求关联的全局论文不存在。"""
+
+
+class TopicPaperAlreadyExistsError(Exception):
+    """表示同一论文被重复关联到同一专题。"""
+
+
+class TopicRepository(Protocol):
+    """定义专题与专题论文的持久化端口。"""
+
+    def create(self, topic: Topic) -> Topic: ...
+    def get(self, topic_id: UUID) -> Topic | None: ...
+    def list(self, *, limit: int) -> list[Topic]: ...
+    def update(self, topic_id: UUID, **values: object) -> Topic | None: ...
+    def delete(self, topic_id: UUID) -> bool: ...
+    def add_paper(self, link: TopicPaper) -> TopicPaper: ...
+    def get_paper_link(self, topic_id: UUID, paper_id: str) -> TopicPaper | None: ...
+
+    def update_paper(
+        self,
+        topic_id: UUID,
+        paper_id: str,
+        *,
+        is_favorite: bool | None = None,
+        reading_status: ReadingStatus | None = None,
+    ) -> TopicPaper | None: ...
+
+    def list_papers(
+        self,
+        topic_id: UUID,
+        *,
+        limit: int,
+    ) -> list[TopicPaperView]: ...
+
+
+class PaperRepository(Protocol):
+    """定义专题关联所需的最小论文查询端口。"""
+
+    def get(self, paper_id: str) -> Paper | None: ...
+```
+
+用下面内容完整替换 `app/infrastructure/persistence/topic_repository.py`，收藏和阅读状态在同一事务中更新：
+
+```python
+from uuid import UUID
+
+from sqlalchemy import delete, select
+from sqlalchemy.exc import IntegrityError
+
+from app.domain.topics.models import (
+    ReadingStatus,
+    Topic,
+    TopicPaper,
+    TopicPaperView,
+)
+from app.domain.topics.ports import (
+    TopicAlreadyExistsError,
+    TopicPaperAlreadyExistsError,
+)
+from app.infrastructure.persistence.models import PaperRecord
+from app.infrastructure.persistence.topic_models import TopicPaperRecord, TopicRecord
+
+
+def to_topic(record: TopicRecord) -> Topic:
+    """将专题 ORM 记录转换为领域对象。
+
+    :param record: PostgreSQL 专题记录。
+    :return: 不依赖 SQLAlchemy 的专题对象。
+    """
+    return Topic(
+        id=record.id,
+        workspace_id=record.workspace_id,
+        name=record.name,
+        description=record.description,
+        keywords=list(record.keywords),
+        categories=list(record.categories),
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def to_topic_paper(record: TopicPaperRecord) -> TopicPaper:
+    """将专题论文 ORM 记录转换为领域对象。
+
+    :param record: PostgreSQL 专题论文记录。
+    :return: 包含收藏与阅读状态的关联对象。
+    """
+    return TopicPaper(
+        topic_id=record.topic_id,
+        paper_id=record.paper_id,
+        is_favorite=record.is_favorite,
+        reading_status=ReadingStatus(record.reading_status),
+        created_at=record.created_at,
+    )
+
+
+class PostgresTopicRepository:
+    """使用 PostgreSQL 保存专题和专题论文状态。"""
+
+    def __init__(self, session_factory) -> None:
+        self.session_factory = session_factory
+
+    def create(self, topic: Topic) -> Topic:
+        """创建专题。
+
+        :param topic: 待持久化的专题。
+        :return: 数据库中的专题。
+        :raises TopicAlreadyExistsError: 同工作区专题名称重复时抛出。
+        """
+        record = TopicRecord(**topic.model_dump())
+        try:
+            with self.session_factory() as session:
+                session.add(record)
+                session.commit()
+                session.refresh(record)
+                return to_topic(record)
+        except IntegrityError as exc:
+            raise TopicAlreadyExistsError(topic.name) from exc
+
+    def get(self, topic_id: UUID) -> Topic | None:
+        """按 ID 查询专题。
+
+        :param topic_id: 专题 ID。
+        :return: 专题不存在时返回 None。
+        """
+        with self.session_factory() as session:
+            record = session.get(TopicRecord, topic_id)
+            return None if record is None else to_topic(record)
+
+    def list(self, *, limit: int) -> list[Topic]:
+        """按创建时间倒序查询专题。
+
+        :param limit: 最多返回数量。
+        :return: 专题列表。
+        """
+        with self.session_factory() as session:
+            statement = (
+                select(TopicRecord)
+                .order_by(TopicRecord.created_at.desc(), TopicRecord.id.desc())
+                .limit(limit)
+            )
+            return [to_topic(record) for record in session.scalars(statement).all()]
+
+    def update(self, topic_id: UUID, **values: object) -> Topic | None:
+        """局部更新专题。
+
+        :param topic_id: 专题 ID。
+        :param values: 已由应用层验证的更新字段。
+        :return: 更新后的专题；不存在时返回 None。
+        :raises TopicAlreadyExistsError: 更新后名称冲突时抛出。
+        """
+        try:
+            with self.session_factory() as session:
+                record = session.get(TopicRecord, topic_id)
+                if record is None:
+                    return None
+                for field, value in values.items():
+                    setattr(record, field, value)
+                session.commit()
+                session.refresh(record)
+                return to_topic(record)
+        except IntegrityError as exc:
+            raise TopicAlreadyExistsError(str(values.get("name", topic_id))) from exc
+
+    def delete(self, topic_id: UUID) -> bool:
+        """删除专题及其关联。
+
+        :param topic_id: 专题 ID。
+        :return: 实际删除一条专题时返回 True。
+        """
+        with self.session_factory() as session:
+            result = session.execute(delete(TopicRecord).where(TopicRecord.id == topic_id))
+            session.commit()
+            return result.rowcount == 1
+
+    def add_paper(self, link: TopicPaper) -> TopicPaper:
+        """将全局论文关联到专题。
+
+        :param link: 待持久化的关联。
+        :return: 已保存的关联。
+        :raises TopicPaperAlreadyExistsError: 关联已存在时抛出。
+        """
+        record = TopicPaperRecord(
+            **link.model_dump(exclude={"reading_status"}),
+            reading_status=link.reading_status.value,
+        )
+        try:
+            with self.session_factory() as session:
+                session.add(record)
+                session.commit()
+                session.refresh(record)
+                return to_topic_paper(record)
+        except IntegrityError as exc:
+            raise TopicPaperAlreadyExistsError(link.paper_id) from exc
+
+    def get_paper_link(self, topic_id: UUID, paper_id: str) -> TopicPaper | None:
+        """查询专题论文关联。
+
+        :param topic_id: 专题 ID。
+        :param paper_id: 全局论文 ID。
+        :return: 关联不存在时返回 None。
+        """
+        with self.session_factory() as session:
+            record = session.get(
+                TopicPaperRecord,
+                {"topic_id": topic_id, "paper_id": paper_id},
+            )
+            return None if record is None else to_topic_paper(record)
+
+    def update_paper(
+        self,
+        topic_id: UUID,
+        paper_id: str,
+        *,
+        is_favorite: bool | None = None,
+        reading_status: ReadingStatus | None = None,
+    ) -> TopicPaper | None:
+        """更新专题论文的收藏或阅读状态。
+
+        :param topic_id: 专题 ID。
+        :param paper_id: 全局论文 ID。
+        :param is_favorite: 可选的新收藏状态。
+        :param reading_status: 可选的新阅读状态。
+        :return: 更新后的关联；不存在时返回 None。
+        """
+        with self.session_factory() as session:
+            record = session.get(
+                TopicPaperRecord,
+                {"topic_id": topic_id, "paper_id": paper_id},
+            )
+            if record is None:
+                return None
+            if is_favorite is not None:
+                record.is_favorite = is_favorite
+            if reading_status is not None:
+                record.reading_status = reading_status.value
+            session.commit()
+            session.refresh(record)
+            return to_topic_paper(record)
+
+    def list_papers(self, topic_id: UUID, *, limit: int) -> list[TopicPaperView]:
+        """查询专题内论文和工作流状态。
+
+        :param topic_id: 专题 ID。
+        :param limit: 最多返回数量。
+        :return: 包含论文元数据和专题内状态的列表。
+        """
+        statement = (
+            select(PaperRecord, TopicPaperRecord)
+            .join(TopicPaperRecord, TopicPaperRecord.paper_id == PaperRecord.paper_id)
+            .where(TopicPaperRecord.topic_id == topic_id)
+            .order_by(TopicPaperRecord.created_at.desc(), PaperRecord.paper_id.desc())
+            .limit(limit)
+        )
+        with self.session_factory() as session:
+            return [
+                TopicPaperView(
+                    topic_id=link.topic_id,
+                    paper_id=paper.paper_id,
+                    title=paper.title,
+                    authors=list(paper.authors),
+                    url=paper.url,
+                    pdf_url=paper.pdf_url,
+                    is_favorite=link.is_favorite,
+                    reading_status=ReadingStatus(link.reading_status),
+                    created_at=link.created_at,
+                )
+                for paper, link in session.execute(statement)
+            ]
+```
+
+用下面内容完整替换 `app/application/topic_paper_service.py`：
+
+```python
+from uuid import UUID
+
+from app.domain.topics.models import (
+    ReadingStatus,
+    TopicPaper,
+    TopicPaperView,
+)
+from app.domain.topics.ports import (
+    PaperNotFoundError,
+    PaperRepository,
+    TopicNotFoundError,
+    TopicRepository,
+)
+
+
+class TopicPaperService:
+    """编排专题论文关联和用户工作流状态。"""
+
+    def __init__(self, topics: TopicRepository, papers: PaperRepository) -> None:
+        self.topics = topics
+        self.papers = papers
+
+    def add(self, topic_id: UUID, paper_id: str) -> TopicPaper:
+        """将已存在的全局论文关联到专题。
+
+        :param topic_id: 专题 ID。
+        :param paper_id: 全局论文 ID。
+        :return: 新建的专题论文关联。
+        :raises TopicNotFoundError: 专题不存在时抛出。
+        :raises PaperNotFoundError: 论文不存在时抛出。
+        """
+        if self.topics.get(topic_id) is None:
+            raise TopicNotFoundError(str(topic_id))
+        if self.papers.get(paper_id) is None:
+            raise PaperNotFoundError(paper_id)
+        return self.topics.add_paper(
+            TopicPaper(topic_id=topic_id, paper_id=paper_id)
+        )
+
+    def list(self, topic_id: UUID, limit: int) -> list[TopicPaperView]:
+        """查询专题内论文和用户状态。
+
+        :param topic_id: 专题 ID。
+        :param limit: 最多返回数量。
+        :return: 专题论文展示列表。
+        :raises TopicNotFoundError: 专题不存在时抛出。
+        """
+        if self.topics.get(topic_id) is None:
+            raise TopicNotFoundError(str(topic_id))
+        return self.topics.list_papers(topic_id, limit=limit)
+
+    def update(
+        self,
+        topic_id: UUID,
+        paper_id: str,
+        *,
+        is_favorite: bool | None = None,
+        reading_status: ReadingStatus | None = None,
+    ) -> TopicPaper:
+        """更新专题论文的收藏或阅读状态。
+
+        :param topic_id: 专题 ID。
+        :param paper_id: 全局论文 ID。
+        :param is_favorite: 可选的新收藏状态。
+        :param reading_status: 可选的新阅读状态。
+        :return: 更新后的专题论文。
+        :raises ValueError: 没有提供可更新字段时抛出。
+        :raises TopicNotFoundError: 专题论文关联不存在时抛出。
+        """
+        if is_favorite is None and reading_status is None:
+            raise ValueError("at least one topic-paper field is required")
+        link = self.topics.update_paper(
+            topic_id,
+            paper_id,
+            is_favorite=is_favorite,
+            reading_status=reading_status,
+        )
+        if link is None:
+            raise TopicNotFoundError(
+                f"topic paper not found: {topic_id}/{paper_id}"
+            )
+        return link
+```
+
+用下面内容完整替换 `app/schemas/topics.py`：
+
+```python
+from datetime import datetime
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.domain.topics.models import ReadingStatus, TopicPaperView
+
+
+class CreateTopicRequest(BaseModel):
+    """校验新建专题请求。"""
+
+    name: str = Field(min_length=1, max_length=120)
+    description: str = Field(default="", max_length=2000)
+    keywords: list[str] = Field(min_length=1)
+    categories: list[str] = Field(default_factory=list)
+
+
+class UpdateTopicRequest(BaseModel):
+    """校验专题的局部更新请求。"""
+
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    description: str | None = Field(default=None, max_length=2000)
+    keywords: list[str] | None = Field(default=None, min_length=1)
+    categories: list[str] | None = None
+
+
+class TopicResponse(BaseModel):
+    """表示专题 HTTP 响应。"""
+
+    id: UUID
+    name: str
+    description: str
+    keywords: list[str]
+    categories: list[str]
+    created_at: datetime | None
+    updated_at: datetime | None
+
+    @classmethod
+    def from_domain(cls, topic) -> "TopicResponse":
+        """将专题领域对象转换为 HTTP 响应。
+
+        :param topic: 专题领域对象。
+        :return: 隐藏固定工作区 ID 的响应。
+        """
+        return cls(**topic.model_dump(exclude={"workspace_id"}))
+
+
+class TopicListResponse(BaseModel):
+    """表示专题列表响应。"""
+
+    items: list[TopicResponse]
+
+
+class AddTopicPaperRequest(BaseModel):
+    """校验关联全局论文的请求。"""
+
+    paper_id: str = Field(min_length=1, max_length=128)
+
+
+class UpdateTopicPaperRequest(BaseModel):
+    """校验专题论文的局部更新请求。"""
+
+    is_favorite: bool | None = None
+    reading_status: ReadingStatus | None = None
+
+    @model_validator(mode="after")
+    def require_update(self) -> "UpdateTopicPaperRequest":
+        """拒绝不包含任何更新字段的请求。
+
+        :return: 已确认包含至少一个更新字段的请求。
+        :raises ValueError: 收藏和阅读状态都未提供时抛出。
+        """
+        if self.is_favorite is None and self.reading_status is None:
+            raise ValueError("at least one topic-paper field is required")
+        return self
+
+
+class TopicPaperResponse(BaseModel):
+    """表示专题论文关联响应。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    topic_id: UUID
+    paper_id: str
+    is_favorite: bool
+    reading_status: ReadingStatus
+    created_at: datetime | None
+
+
+class TopicPaperListResponse(BaseModel):
+    """表示包含论文元数据的专题论文列表。"""
+
+    items: list[TopicPaperView]
+```
+
+用下面内容完整替换 `app/api/v1/topic_papers.py`：
+
+```python
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+
+from app.api.dependencies import get_topic_paper_service
+from app.application.topic_paper_service import TopicPaperService
+from app.domain.topics.ports import (
+    PaperNotFoundError,
+    TopicNotFoundError,
+    TopicPaperAlreadyExistsError,
+)
+from app.schemas.topics import (
+    AddTopicPaperRequest,
+    TopicPaperListResponse,
+    TopicPaperResponse,
+    UpdateTopicPaperRequest,
+)
+
+
+router = APIRouter(prefix="/topics/{topic_id}/papers", tags=["topic-papers"])
+
+
+@router.get("", response_model=TopicPaperListResponse)
+def list_topic_papers(
+    topic_id: UUID,
+    limit: int = 100,
+    service: TopicPaperService = Depends(get_topic_paper_service),
+) -> TopicPaperListResponse:
+    """查询专题内论文和阅读状态。
+
+    :param topic_id: 专题 ID。
+    :param limit: 最多返回数量。
+    :param service: 注入的专题论文服务。
+    :return: 专题论文列表。
+    :raises HTTPException: 专题不存在时返回 404。
+    """
+    try:
+        return TopicPaperListResponse(
+            items=service.list(topic_id, min(max(limit, 1), 500))
+        )
+    except TopicNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="topic not found") from exc
+
+
+@router.post("", response_model=TopicPaperResponse, status_code=status.HTTP_201_CREATED)
+def add_topic_paper(
+    topic_id: UUID,
+    request: AddTopicPaperRequest,
+    service: TopicPaperService = Depends(get_topic_paper_service),
+) -> TopicPaperResponse:
+    """将已存在的全局论文关联到专题。
+
+    :param topic_id: 专题 ID。
+    :param request: 包含论文 ID 的请求。
+    :param service: 注入的专题论文服务。
+    :return: 新建的专题论文关联。
+    :raises HTTPException: 专题或论文不存在时返回 404，重复关联时返回 409。
+    """
+    try:
+        return TopicPaperResponse.model_validate(
+            service.add(topic_id, request.paper_id)
+        )
+    except (TopicNotFoundError, PaperNotFoundError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except TopicPaperAlreadyExistsError as exc:
+        raise HTTPException(status_code=409, detail="paper already linked") from exc
+
+
+@router.patch("/{paper_id}", response_model=TopicPaperResponse)
+def update_topic_paper(
+    topic_id: UUID,
+    paper_id: str,
+    request: UpdateTopicPaperRequest,
+    service: TopicPaperService = Depends(get_topic_paper_service),
+) -> TopicPaperResponse:
+    """更新专题论文的收藏或阅读状态。
+
+    :param topic_id: 专题 ID。
+    :param paper_id: 全局论文 ID。
+    :param request: 至少包含一个状态字段的局部更新。
+    :param service: 注入的专题论文服务。
+    :return: 更新后的专题论文关联。
+    :raises HTTPException: 专题论文关联不存在时返回 404。
+    """
+    try:
+        return TopicPaperResponse.model_validate(
+            service.update(
+                topic_id,
+                paper_id,
+                **request.model_dump(exclude_unset=True),
+            )
+        )
+    except TopicNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+```
+
+Pydantic 会把非法状态拒绝为 `422`；空请求也返回 `422`。Repository 查询必须同时使用 `topic_id` 和 `paper_id`，跨专题更新返回 `404`。
+
+### 前端增量与验证
+
+用下面内容完整替换 `frontend-web/src/api/topics.ts`：
+
+```ts
+export type ReadingStatus = "unread" | "reading" | "read" | "archived";
+
+export type Topic = {
+  id: string;
+  name: string;
+  description: string;
+  keywords: string[];
+  categories: string[];
+};
+
+export type TopicPaper = {
+  paper_id: string;
+  title?: string;
+  authors?: string[];
+  url?: string;
+  pdf_url?: string;
+  is_favorite: boolean;
+  reading_status: ReadingStatus;
+};
+
+export type Source = {
+  paper_id: string;
+  title: string;
+  url: string;
+  pdf_url?: string;
+  chunk_id: string;
+  section_title?: string;
+  page_start: number;
+  page_end: number;
+  text: string;
+  semantic_distance?: number;
+  keyword_score?: number;
+  rerank_score: number;
+};
+
+export type Answer = {
+  answer: string;
+  answer_status: "answered" | "insufficient_evidence" | "generation_unavailable";
+  insufficient_evidence: boolean;
+  sources: Source[];
+  index_version: string;
+};
+
+const baseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${baseUrl}${path}`, {
+    headers: { "Content-Type": "application/json", ...init?.headers },
+    ...init,
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as {
+      detail?: string;
+      title?: string;
+    } | null;
+    throw new Error(body?.detail ?? body?.title ?? `请求失败（${response.status}）`);
+  }
+  return response.status === 204
+    ? (undefined as T)
+    : response.json() as Promise<T>;
+}
+
+export function listTopics(): Promise<{ items: Topic[] }> {
+  return request("/api/v1/topics");
+}
+
+export function createTopic(
+  input: Pick<Topic, "name" | "description" | "keywords" | "categories">,
+): Promise<Topic> {
+  return request("/api/v1/topics", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function getTopic(topicId: string): Promise<Topic> {
+  return request(`/api/v1/topics/${topicId}`);
+}
+
+export function listTopicPapers(topicId: string): Promise<{ items: TopicPaper[] }> {
+  return request(`/api/v1/topics/${topicId}/papers`);
+}
+
+export function updateTopicPaper(
+  topicId: string,
+  paperId: string,
+  patch: { is_favorite?: boolean; reading_status?: ReadingStatus },
+): Promise<TopicPaper> {
+  return request(`/api/v1/topics/${topicId}/papers/${encodeURIComponent(paperId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(patch),
+  });
+}
+
+export function setFavorite(
+  topicId: string,
+  paperId: string,
+  isFavorite: boolean,
+): Promise<TopicPaper> {
+  return updateTopicPaper(topicId, paperId, { is_favorite: isFavorite });
+}
+
+export function searchTopic(
+  topicId: string,
+  question: string,
+): Promise<{ sources: Source[]; index_version: string }> {
+  return request(`/api/v1/topics/${topicId}/search`, {
+    method: "POST",
+    body: JSON.stringify({ question }),
+  });
+}
+
+export function askTopic(topicId: string, question: string): Promise<Answer> {
+  return request(`/api/v1/topics/${topicId}/ask`, {
+    method: "POST",
+    body: JSON.stringify({ question }),
+  });
+}
+```
+
+用下面内容完整替换 `frontend-web/src/components/PaperList.tsx`：
+
+```tsx
+import { ReadingStatus, TopicPaper } from "../api/topics";
+
+type Patch = { is_favorite?: boolean; reading_status?: ReadingStatus };
+type Props = {
+  papers: TopicPaper[];
+  onUpdate(paper: TopicPaper, patch: Patch): Promise<void>;
+};
+
+const statusLabels: Record<ReadingStatus, string> = {
+  unread: "未读",
+  reading: "阅读中",
+  read: "已读",
+  archived: "已归档",
+};
+
+export function PaperList({ papers, onUpdate }: Props) {
+  if (papers.length === 0) return <p>当前筛选下没有论文。</p>;
+  return <ul>{papers.map((paper) => <li key={paper.paper_id}>
+    <strong>{paper.title ?? paper.paper_id}</strong>{" "}
+    {paper.url && <a href={paper.url} target="_blank" rel="noreferrer">打开论文</a>}{" "}
+    <button
+      onClick={() => void onUpdate(paper, { is_favorite: !paper.is_favorite })}
+      type="button"
+    >
+      {paper.is_favorite ? "取消收藏" : "收藏"}
+    </button>{" "}
+    <label>阅读状态：
+      <select
+        value={paper.reading_status}
+        onChange={(event) => void onUpdate(paper, {
+          reading_status: event.target.value as ReadingStatus,
+        })}
+      >
+        {Object.entries(statusLabels).map(([value, label]) => (
+          <option key={value} value={value}>{label}</option>
+        ))}
+      </select>
+    </label>
+  </li>)}</ul>;
+}
+```
+
+用下面内容完整替换本阶段前文的 `frontend-web/src/pages/TopicDetailPage.tsx`：
+
+```tsx
+import { useEffect, useMemo, useState } from "react";
+
+import {
+  getTopic,
+  listTopicPapers,
+  ReadingStatus,
+  Topic,
+  TopicPaper,
+  updateTopicPaper,
+} from "../api/topics";
+import { PaperList } from "../components/PaperList";
+import { SearchPanel } from "../components/SearchPanel";
+import { ResearchWorkflowPage } from "./ResearchWorkflowPage";
+
+type Patch = { is_favorite?: boolean; reading_status?: ReadingStatus };
+
+export function TopicDetailPage({
+  topicId,
+  onBack,
+}: {
+  topicId: string;
+  onBack(): void;
+}) {
+  const [topic, setTopic] = useState<Topic | null>(null);
+  const [papers, setPapers] = useState<TopicPaper[]>([]);
+  const [statusFilter, setStatusFilter] = useState<ReadingStatus | "all">("all");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    void Promise.all([getTopic(topicId), listTopicPapers(topicId)])
+      .then(([nextTopic, links]) => {
+        setTopic(nextTopic);
+        setPapers(links.items);
+      })
+      .catch((reason) => setError(
+        reason instanceof Error ? reason.message : "无法加载专题",
+      ));
+  }, [topicId]);
+
+  const visiblePapers = useMemo(
+    () => statusFilter === "all"
+      ? papers
+      : papers.filter((paper) => paper.reading_status === statusFilter),
+    [papers, statusFilter],
+  );
+
+  async function updatePaper(paper: TopicPaper, patch: Patch) {
+    try {
+      const updated = await updateTopicPaper(topicId, paper.paper_id, patch);
+      setPapers((items) => items.map((item) => (
+        item.paper_id === updated.paper_id ? { ...item, ...updated } : item
+      )));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "更新论文状态失败");
+    }
+  }
+
+  if (error) return <main>
+    <button onClick={onBack} type="button">返回专题列表</button>
+    <p role="alert">{error}</p>
+  </main>;
+  if (!topic) return <main><p>正在加载专题…</p></main>;
+  return <main>
+    <button onClick={onBack} type="button">返回专题列表</button>
+    <h1>{topic.name}</h1>
+    <p>{topic.description}</p>
+    <p>关键词：{topic.keywords.join("、")}</p>
+    <h2>论文</h2>
+    <label>筛选阅读状态：
+      <select
+        value={statusFilter}
+        onChange={(event) => setStatusFilter(
+          event.target.value as ReadingStatus | "all",
+        )}
+      >
+        <option value="all">全部</option>
+        <option value="unread">未读</option>
+        <option value="reading">阅读中</option>
+        <option value="read">已读</option>
+        <option value="archived">已归档</option>
+      </select>
+    </label>
+    <PaperList papers={visiblePapers} onUpdate={updatePaper} />
+    <SearchPanel topicId={topicId} />
+    <ResearchWorkflowPage topicId={topicId} />
+  </main>;
+}
+```
+
+筛选器只改变当前页面展示，不伪造服务端数据；刷新页面后必须仍能从 PostgreSQL 恢复状态。
+
+创建 `tests/unit/test_reading_status.py`：
+
+```python
+from uuid import uuid4
+
+import pytest
+
+from app.application.topic_paper_service import TopicPaperService
+from app.domain.topics.models import ReadingStatus, TopicPaper
+
+
+class FakeTopics:
+    def __init__(self) -> None:
+        self.link = TopicPaper(topic_id=uuid4(), paper_id="p1")
+
+    def update_paper(
+        self,
+        topic_id,
+        paper_id,
+        *,
+        is_favorite=None,
+        reading_status=None,
+    ):
+        """更新内存中的专题论文状态。
+
+        :param topic_id: 专题 ID。
+        :param paper_id: 论文 ID。
+        :param is_favorite: 可选收藏状态。
+        :param reading_status: 可选阅读状态。
+        :return: 更新后的关联；标识不匹配时返回 None。
+        """
+        if (topic_id, paper_id) != (self.link.topic_id, self.link.paper_id):
+            return None
+        self.link = self.link.model_copy(update={
+            "is_favorite": (
+                self.link.is_favorite if is_favorite is None else is_favorite
+            ),
+            "reading_status": reading_status or self.link.reading_status,
+        })
+        return self.link
+
+
+class FakePapers:
+    def get(self, paper_id):
+        """返回不被本测试调用的论文查询结果。
+
+        :param paper_id: 论文 ID。
+        :return: None。
+        """
+        return None
+
+
+def test_favorite_and_reading_status_update_together() -> None:
+    """验证收藏与阅读状态可在一次调用中更新。
+
+    :return: None；通过断言验证两个字段。
+    """
+    topics = FakeTopics()
+    service = TopicPaperService(topics, FakePapers())
+
+    updated = service.update(
+        topics.link.topic_id,
+        "p1",
+        is_favorite=True,
+        reading_status=ReadingStatus.READING,
+    )
+
+    assert updated.is_favorite is True
+    assert updated.reading_status is ReadingStatus.READING
+
+
+def test_empty_update_is_rejected() -> None:
+    """验证空的局部更新不会伪装成成功。
+
+    :return: None；通过异常断言验证失败边界。
+    """
+    topics = FakeTopics()
+    service = TopicPaperService(topics, FakePapers())
+
+    with pytest.raises(ValueError, match="at least one"):
+        service.update(topics.link.topic_id, "p1")
+```
+
+创建 `tests/api/test_reading_status.py`：
+
+```python
+from types import SimpleNamespace
+from uuid import uuid4
+
+from fastapi.testclient import TestClient
+
+from app.domain.topics.models import ReadingStatus, TopicPaper
+from app.main import create_app
+
+
+class FakeTopicPaperService:
+    def __init__(self) -> None:
+        self.topic_id = uuid4()
+
+    def update(self, topic_id, paper_id, **values):
+        """返回包含请求状态的内存关联。
+
+        :param topic_id: 专题 ID。
+        :param paper_id: 论文 ID。
+        :param values: 已由 DTO 验证的更新字段。
+        :return: 更新后的专题论文关联。
+        """
+        return TopicPaper(
+            topic_id=topic_id,
+            paper_id=paper_id,
+            is_favorite=values.get("is_favorite", False),
+            reading_status=values.get("reading_status", ReadingStatus.UNREAD),
+        )
+
+
+def client_and_path() -> tuple[TestClient, str]:
+    """创建只暴露专题论文 Fake 的 API 客户端。
+
+    :return: 测试客户端和一条专题论文路径。
+    """
+    service = FakeTopicPaperService()
+    container = SimpleNamespace(topic_paper_service=service)
+    path = f"/api/v1/topics/{service.topic_id}/papers/p1"
+    return TestClient(create_app(container)), path
+
+
+def test_patch_accepts_reading_status() -> None:
+    """验证合法阅读状态可被 API 保存。
+
+    :return: None；通过响应断言验证状态值。
+    """
+    client, path = client_and_path()
+
+    response = client.patch(path, json={"reading_status": "read"})
+
+    assert response.status_code == 200
+    assert response.json()["reading_status"] == "read"
+
+
+def test_patch_rejects_empty_and_unknown_status() -> None:
+    """验证空补丁和未知阅读状态均返回 422。
+
+    :return: None；通过状态码断言验证 DTO 校验。
+    """
+    client, path = client_and_path()
+
+    assert client.patch(path, json={}).status_code == 422
+    assert client.patch(path, json={"reading_status": "unknown"}).status_code == 422
+```
+
+还必须在 PostgreSQL 集成测试和迁移演练中验证：
+
+- 收藏和阅读状态可以分别更新，也可以在同一 PATCH 中更新。
+- 空 PATCH 与非法状态返回 `422`。
+- 专题 B 不能更新专题 A 的论文状态。
+- `0004 -> 0005 -> 0004 -> 0005` 可回滚并重新升级。
+- 页面刷新后状态仍来自 PostgreSQL，删除笔记不影响论文或阅读状态。
+
+前置条件：`0005` 已应用，TopicPaper Router 已替换，前端类型检查通过。满足后运行：
+
+```bash
+PAPER_MIND_TEST_POSTGRES_URL=<可丢弃的数据库 URL> uv run pytest tests/unit/test_reading_status.py tests/api/test_reading_status.py tests/integration/test_research_repositories.py -q
+npm --prefix frontend-web run build
+```
 
 最终人工验收路径为：在专题中筛选未读论文，打开一篇全文论文标记为阅读中，写一条关联页码来源的笔记，选择多篇已读论文生成带来源比较，再将用户编辑后的假设、支持/冲突证据和待验证问题保存为 Idea 卡片。每一步都能刷新恢复，且任意 AI 生成内容缺少来源时显示为待核对。
+
+## 阶段 5 文件收口清单
+
+- 新增研究领域：`app/domain/research/`、`app/domain/notes/`、`app/domain/comparisons/`、`app/domain/ideas/` 中本阶段列出的模型与端口。
+- 新增应用与持久化：`app/application/note_service.py`、`comparison_service.py`、`idea_service.py`、`app/infrastructure/persistence/research_models.py`、`research_repositories.py`。
+- 新增 HTTP 与前端：`app/schemas/notes.py`、`comparisons.py`、`ideas.py`，`app/api/v1/notes.py`、`comparisons.py`、`ideas.py`，以及 `frontend-web/src/pages/ResearchWorkflowPage.tsx` 和本阶段列出的研究 API 封装。
+- 新增迁移与测试：`migrations/versions/0004_research_workflow.py`、`0005_reading_status.py` 及本阶段列出的 unit/API/integration 测试。
+- 完整替换：`app/api/dependencies.py`、`app/api/v1/router.py`、`app/core/container.py`、`app/main.py`、专题 domain/port/ORM/Repository/Service/DTO/Router，以及 `frontend-web/src/api/topics.ts`、`components/PaperList.tsx`、`pages/TopicDetailPage.tsx`、`App.tsx`。
+- 删除：无。已被“唯一最终版本”取代的早期教学片段不写入实际文件。
+
+前置条件：`0005` 已应用到可丢弃数据库，全部最终文件已保存，依赖服务与固定索引已验证。满足后运行：
+
+```bash
+uv run ruff format app tests evaluation
+uv run ruff format --check app tests evaluation
+uv run ruff check app tests evaluation
+POSTGRES_URL=<可丢弃的数据库 URL> uv run alembic upgrade head
+uv run pytest tests/unit tests/api -q
+PAPER_MIND_TEST_POSTGRES_URL=<可丢弃的数据库 URL> uv run pytest -m integration -q
+npm --prefix frontend-web run lint
+npm --prefix frontend-web run build
+```
+
+自动检查全部通过后，再执行上述完整人工路径。至此的产物是 V1.1；V1.0 仍以阶段 4 验收记录为准。

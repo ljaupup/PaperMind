@@ -338,7 +338,14 @@ class DocumentService:
         self.topics = topics
 
     def register(self, topic_id: UUID, paper_id: str, source_url: str) -> Document:
-        """Create metadata for one topic-visible paper before background indexing."""
+        """为专题可见论文创建全文元数据。
+
+        :param topic_id: 论文所属专题的 ID。
+        :param paper_id: 全局论文 ID。
+        :param source_url: 可下载全文的来源地址。
+        :return: 已保存、等待后台索引的文档。
+        :raises LookupError: 论文不属于指定专题时抛出。
+        """
         if self.topics is None or self.topics.get_paper_link(topic_id, paper_id) is None:
             raise LookupError("topic paper not found")
         document = Document(
@@ -445,6 +452,8 @@ def test_download_failure_does_not_become_parse_failure() -> None:
     assert document.status is ParseStatus.DOWNLOAD_FAILED
 ```
 
+前置条件：`test_document_service.py` 已保存，测试使用 Fake 下载器和解析器，不连接外部服务。满足后运行：
+
 ```bash
 uv run pytest tests/unit/test_document_service.py -q
 ```
@@ -517,6 +526,11 @@ depends_on = None
 
 
 def upgrade() -> None:
+    op.add_column(
+        "papers",
+        sa.Column("categories", postgresql.ARRAY(sa.String()), nullable=False, server_default="{}"),
+    )
+    op.create_index("ix_papers_categories", "papers", ["categories"], postgresql_using="gin")
     op.create_table(
         "index_versions",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
@@ -577,7 +591,179 @@ def downgrade() -> None:
     op.drop_index("ix_index_versions_status", table_name="index_versions")
     op.drop_index("ix_index_versions_topic_id", table_name="index_versions")
     op.drop_table("index_versions")
+    op.drop_index("ix_papers_categories", table_name="papers")
+    op.drop_column("papers", "categories")
 ```
+
+`papers.categories` 在阶段 3 才加入，因为分类过滤属于检索优化，不改变阶段 1 的最小持久化边界。同步扩展 `Paper` 和 `PaperRecord`：
+
+用下面内容完整替换阶段 1 的 `app/domain/models.py`：
+
+```python
+from datetime import datetime
+
+from pydantic import BaseModel, Field
+
+
+class Paper(BaseModel):
+    """表示跨专题复用的全局论文元数据。"""
+
+    paper_id: str = Field(min_length=1, max_length=128)
+    title: str = Field(min_length=1)
+    abstract: str = ""
+    authors: list[str] = Field(default_factory=list)
+    categories: list[str] = Field(default_factory=list)
+    url: str
+    pdf_url: str | None = None
+    published_at: datetime | None = None
+    file_path: str | None = None
+    file_hash: str | None = None
+    parse_status: str = "metadata_only"
+
+
+class PaperChunk(BaseModel):
+    """表示阶段 1 索引中保留的摘要片段。"""
+
+    chunk_id: str
+    paper_id: str
+    title: str
+    url: str
+    pdf_url: str | None = None
+    page: int | None = None
+    text: str = Field(min_length=1)
+```
+
+用下面内容完整替换 `app/infrastructure/persistence/models.py`：
+
+```python
+from datetime import datetime
+
+from sqlalchemy import DateTime, JSON, String, Text, func
+from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    """作为 PaperMind 全部 SQLAlchemy ORM 记录的基类。"""
+
+
+class PaperRecord(Base):
+    """将全局论文元数据映射到 PostgreSQL。"""
+
+    __tablename__ = "papers"
+
+    paper_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    abstract: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    authors: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    categories: Mapped[list[str]] = mapped_column(
+        ARRAY(String()),
+        nullable=False,
+        default=list,
+        server_default="{}",
+    )
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    pdf_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    file_path: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    file_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    parse_status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="metadata_only",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+```
+
+用下面内容完整替换 `app/infrastructure/arxiv/collector.py`，使分类过滤具有真实数据来源：
+
+```python
+import asyncio
+
+import arxiv
+
+from app.domain.models import Paper
+
+
+_CLIENT = arxiv.Client(page_size=10, delay_seconds=4.0, num_retries=1)
+
+
+def clean_text(value: str | None) -> str:
+    """压缩外部元数据中的连续空白。
+
+    :param value: 可能为空的原始文本。
+    :return: 去除首尾和连续空白的文本。
+    """
+    return " ".join(value.split()) if value else ""
+
+
+def result_to_paper(result: arxiv.Result) -> Paper:
+    """将 arXiv SDK 结果转换为内部论文模型。
+
+    :param result: arXiv SDK 返回的单条结果。
+    :return: 清洗后的论文领域对象。
+    """
+    return Paper(
+        paper_id=result.get_short_id(),
+        title=clean_text(result.title),
+        abstract=clean_text(result.summary),
+        authors=[
+            name
+            for author in result.authors
+            if (name := clean_text(author.name))
+        ],
+        categories=list(getattr(result, "categories", []) or []),
+        url=result.entry_id,
+        pdf_url=result.pdf_url,
+        published_at=result.published,
+    )
+
+
+def _collect_sync(query: str, max_results: int) -> list[Paper]:
+    """同步调用 arXiv SDK 并转换结果。
+
+    :param query: arXiv 检索表达式。
+    :param max_results: 最多返回的论文数量。
+    :return: 按提交时间倒序的论文列表。
+    :raises RuntimeError: arXiv 返回限流时抛出。
+    :raises arxiv.HTTPError: 其他 arXiv HTTP 错误时抛出。
+    """
+    search = arxiv.Search(
+        query=query,
+        max_results=max_results,
+        sort_by=arxiv.SortCriterion.SubmittedDate,
+        sort_order=arxiv.SortOrder.Descending,
+    )
+    try:
+        return [result_to_paper(result) for result in _CLIENT.results(search)]
+    except arxiv.HTTPError as exc:
+        if exc.status == 429:
+            raise RuntimeError("arXiv 限流；等待至少 60 秒后仅重试一次") from exc
+        raise
+
+
+async def collect_arxiv(query: str, max_results: int) -> list[Paper]:
+    """在工作线程中执行同步 arXiv SDK 查询。
+
+    :param query: arXiv 检索表达式。
+    :param max_results: 最多返回的论文数量。
+    :return: 论文领域对象列表。
+    """
+    return await asyncio.to_thread(_collect_sync, query, max_results)
+```
+
+未知或缺失分类返回空列表，不把 `None` 写入非空列。这样日期、分类和收藏过滤都有真实数据来源。
 
 阶段 3 的迁移已经把 `index_jobs.document_id` 关联到 `documents.id`，所以还必须用下面内容**完整替换** `app/infrastructure/persistence/job_models.py`。不能继续保留阶段 2 中的裸 UUID 声明，否则 ORM 元数据会与数据库约束漂移：
 
@@ -727,27 +913,7 @@ class PostgresIndexVersionRepository:
             )
 ```
 
-将 `0003_documents_and_evaluations.py` 的 `upgrade()` 中、`documents` 建表前加入这个表与索引；`downgrade()` 中在删除 `documents` 前删除它：
-
-```python
-op.create_table(
-    "index_versions",
-    sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-    sa.Column("topic_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("topics.id", ondelete="CASCADE"), nullable=False),
-    sa.Column("version", sa.String(length=120), nullable=False),
-    sa.Column("status", sa.String(length=16), nullable=False),
-    sa.Column("created_at", sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")),
-    sa.UniqueConstraint("topic_id", "version", name="uq_index_versions_topic_version"),
-)
-op.create_index("ix_index_versions_topic_id", "index_versions", ["topic_id"])
-op.create_index("ix_index_versions_status", "index_versions", ["status"])
-```
-
-```python
-op.drop_index("ix_index_versions_status", table_name="index_versions")
-op.drop_index("ix_index_versions_topic_id", table_name="index_versions")
-op.drop_table("index_versions")
-```
+上文给出的唯一 `0003_documents_and_evaluations.py` 已经完整创建并回滚 `index_versions`；不要再次插入同名建表或索引片段，否则迁移会因对象重复而失败。
 
 最后将 `IndexExecutionService` 的三处调用替换为 `self.versions.begin(topic_id, target_version)`、`self.versions.mark_ready(topic_id, target_version)`、`self.versions.mark_failed(topic_id, target_version)`；版本状态始终属于一个专题，不能按裸字符串跨专题更新。
 
@@ -774,9 +940,7 @@ from app.infrastructure.persistence.topic_models import TopicPaperRecord, TopicR
 
 @pytest.mark.integration
 def test_document_chunks_persist_and_keep_versioned_unique_constraint() -> None:
-    url = os.getenv("PAPER_MIND_TEST_POSTGRES_URL")
-    if not url:
-        pytest.skip("PAPER_MIND_TEST_POSTGRES_URL is required for integration tests")
+    url = os.environ["PAPER_MIND_TEST_POSTGRES_URL"]
     engine = create_engine(url)
     Base.metadata.create_all(engine)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
@@ -814,6 +978,8 @@ def test_document_chunks_persist_and_keep_versioned_unique_constraint() -> None:
         Base.metadata.drop_all(engine)
         engine.dispose()
 ```
+
+前置条件：PostgreSQL 已启动并通过健康检查，环境变量指向专用空测试库；该测试会自行建表和清理。满足后运行：
 
 ```bash
 PAPER_MIND_TEST_POSTGRES_URL=<可丢弃的数据库 URL> uv run pytest tests/integration/test_document_repository.py -m integration -q
@@ -974,7 +1140,13 @@ class ChromaVectorStore:
         )
 
     def upsert_chunks(self, chunks: list[PaperChunk], embeddings: list[list[float]]) -> None:
-        """Keep stage-1 abstract chunks available during migration to full text."""
+        """在迁移到全文索引时保留阶段 1 的摘要片段。
+
+        :param chunks: 要写入或更新的摘要片段。
+        :param embeddings: 与片段一一对应的向量。
+        :return: None。
+        :raises ValueError: 片段数量与向量数量不一致时抛出。
+        """
         if len(chunks) != len(embeddings):
             raise ValueError("chunks and embeddings must have equal length")
         if not chunks:
@@ -1019,15 +1191,21 @@ class ChromaVectorStore:
         topic_id: UUID,
         index_version: str,
         top_k: int,
+        paper_ids: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        where_items: list[dict[str, Any]] = [
+            {"kind": {"$eq": "document"}},
+            {"topic_id": {"$eq": str(topic_id)}},
+            {"index_version": {"$eq": index_version}},
+        ]
+        if paper_ids is not None:
+            if not paper_ids:
+                return []
+            where_items.append({"paper_id": {"$in": paper_ids}})
         result = self.collection.query(
             query_embeddings=[embedding],
             n_results=top_k,
-            where={"$and": [
-                {"kind": {"$eq": "document"}},
-                {"topic_id": {"$eq": str(topic_id)}},
-                {"index_version": {"$eq": index_version}},
-            ]},
+            where={"$and": where_items},
         )
         documents = result.get("documents", [[]])[0]
         metadatas = result.get("metadatas", [[]])[0]
@@ -1157,6 +1335,7 @@ class RAGService:
 创建 `app/api/v1/documents.py` 与 `app/api/v1/search.py`。Router 只验证范围并调用 Service：
 
 ```python
+import re
 from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException
 from app.api.dependencies import get_document_repository, get_document_service
@@ -1458,7 +1637,7 @@ def test_chunking_rejects_overlap_not_smaller_than_window() -> None:
         )
 ```
 
-第二个测试刻意覆盖参数错误。先运行纯分块测试，再继续下载、解析和索引：
+第二个测试刻意覆盖参数错误。前置条件：分块实现和该测试文件已保存；它不连接外部服务。先运行纯分块测试，再继续下载、解析和索引：
 
 ```bash
 uv run pytest tests/unit/test_chunking.py -q
@@ -1716,7 +1895,7 @@ tests/api/test_document_status.py
 tests/api/test_search.py
 ```
 
-`test_index_execution_service.py` 使用 Fake Parser、Embedding Client、VectorStore，断言新版本成功后才成为 ready；`test_document_repository.py` 验证版本化 Chunk 唯一约束；`test_search.py` 验证专题过滤、页码来源和 `insufficient_evidence`。运行：
+`test_index_execution_service.py` 使用 Fake Parser、Embedding Client、VectorStore，断言新版本成功后才成为 ready；`test_document_repository.py` 验证版本化 Chunk 唯一约束；`test_search.py` 验证专题过滤、页码来源和 `insufficient_evidence`。前置条件：本节列出的 Service、Router 和测试文件均已保存，当前命令不运行标记为 integration 的 PostgreSQL 测试。满足后运行：
 
 ```bash
 uv run pytest tests/unit/test_document_service.py tests/unit/test_chunking.py tests/unit/test_index_execution_service.py tests/api/test_document_status.py tests/api/test_search.py -q
@@ -1766,7 +1945,12 @@ class IndexExecutionService:
             raise
 
     async def execute(self, job_id: UUID) -> None:
-        """Claim an IndexJob and preserve the previous ready version on failure."""
+        """执行索引任务，并在失败时保留旧的可用版本。
+
+        :param job_id: 要领取并执行的索引任务 ID。
+        :return: None。
+        :raises RuntimeError: 未配置索引任务仓储时抛出。
+        """
         if self.jobs is None:
             raise RuntimeError("IndexExecutionService requires an IndexJob repository for execute()")
         job = self.jobs.mark_running(job_id)
@@ -1775,8 +1959,8 @@ class IndexExecutionService:
         try:
             if job.document_id is None:
                 raise ValueError("full-text IndexJob requires document_id")
-            count = await self.build(job.document_id, job.topic_id, job.target_index_version)
-            self.jobs.finish_success(job.id, indexed_count=count)
+            await self.build(job.document_id, job.topic_id, job.target_index_version)
+            self.jobs.finish_success(job.id)
         except Exception as exc:
             self.jobs.finish_failure(job.id, str(exc))
             raise
@@ -1963,7 +2147,7 @@ async def test_parse_failure_keeps_old_ready_version() -> None:
 - 用户可选择仅检索全文、允许摘要降级或按时间/分类过滤。
 - 索引任务状态通过 Job API 查询，不阻塞页面。
 
-当会话资源已在阶段 1 完成时，回答通过 `POST /api/v1/conversations/{id}/messages` 返回；来源是消息响应的一部分，并保存所用 `index_version`。
+本学习路线不要求持久化会话。回答继续通过 `POST /api/v1/topics/{topic_id}/ask` 返回，来源和本次使用的 `index_version` 都是响应的一部分；阶段 3 不依赖 `Conversation` 或 `Message` 表。
 
 ---
 
@@ -2047,3 +2231,1704 @@ React 中不要只显示“来源 1”；至少显示：
 拒答必须由可测试规则决定，而不是由提示词碰运气。应用服务在生成前检查：候选是否为空、最高证据分是否低于经评测确定的阈值、来源是否覆盖回答中的关键主张。任一条件不满足时返回固定的“证据不足”状态和已有来源，不调用 LLM。API 响应增加 `answer_status`，取值为 `answered`、`insufficient_evidence` 或 `generation_unavailable`；前端按该状态展示原因和可打开的来源。
 
 发布默认策略的门槛是：相对上一个默认版本，Recall@K、MRR、引用正确性和拒答正确率均有记录；延迟与成本未超过已写明预算；至少十条人工审查样本与全部失败样本可追溯。没有达到门槛的策略保留为实验配置，不替换线上默认值。
+
+### 混合检索领域契约与可运行基线
+
+创建 `app/domain/knowledge/retrieval.py`。语义距离、关键词分和最终重排分分开保存，评测时才能判断改进来自哪里：
+
+```python
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Protocol
+from uuid import UUID
+
+
+@dataclass(frozen=True)
+class SearchFilters:
+    """定义专题检索允许使用的元数据过滤条件。"""
+
+    published_from: datetime | None = None
+    categories: tuple[str, ...] = ()
+    favorite_only: bool = False
+
+
+@dataclass(frozen=True)
+class RetrievalCandidate:
+    """保存候选来源及各阶段的独立分数。"""
+
+    paper_id: str
+    title: str
+    url: str
+    pdf_url: str | None
+    chunk_id: UUID
+    section_title: str | None
+    page_start: int
+    page_end: int
+    text: str
+    semantic_distance: float | None = None
+    keyword_score: float | None = None
+    rerank_score: float = 0.0
+
+
+class KeywordSearcher(Protocol):
+    """定义关键词候选和过滤范围查询。"""
+
+    def allowed_paper_ids(self, topic_id: UUID, filters: SearchFilters) -> set[str]:
+        """查询符合专题和元数据过滤条件的论文 ID。
+
+        :param topic_id: 当前专题 ID。
+        :param filters: 日期、分类和收藏过滤条件。
+        :return: 允许进入召回阶段的论文 ID 集合。
+        """
+        ...
+
+    def paper_details(self, paper_ids: set[str]) -> dict[str, tuple[str, str, str | None]]:
+        """查询来源展示所需的论文元数据。
+
+        :param paper_ids: 要查询的论文 ID 集合。
+        :return: 从论文 ID 到标题、原文链接和 PDF 链接的映射。
+        """
+        ...
+
+    def search(
+        self,
+        topic_id: UUID,
+        query: str,
+        filters: SearchFilters,
+        limit: int,
+    ) -> list[RetrievalCandidate]:
+        """按关键词召回专题内的全文片段。
+
+        :param topic_id: 当前专题 ID。
+        :param query: 用户检索问题。
+        :param filters: 元数据过滤条件。
+        :param limit: 最多返回的候选数量。
+        :return: 按关键词分降序排列的候选。
+        """
+        ...
+
+
+class Reranker(Protocol):
+    """定义合并语义和关键词候选的重排序操作。"""
+
+    def rank(
+        self,
+        semantic: list[RetrievalCandidate],
+        keyword: list[RetrievalCandidate],
+        limit: int,
+    ) -> list[RetrievalCandidate]:
+        """融合两路候选并返回最终排序。
+
+        :param semantic: 按向量距离排列的候选。
+        :param keyword: 按关键词分排列的候选。
+        :param limit: 最终保留数量。
+        :return: 带独立原始分和最终重排分的候选。
+        """
+        ...
+```
+
+创建 `app/infrastructure/persistence/keyword_searcher.py`。这是可解释的 PostgreSQL 基线；数据规模扩大后可用 PostgreSQL 全文索引替换 `ILIKE`，但端口不变：
+
+```python
+from uuid import UUID
+
+from sqlalchemy import or_, select
+
+from app.domain.knowledge.retrieval import RetrievalCandidate, SearchFilters
+from app.infrastructure.persistence.document_models import DocumentChunkRecord
+from app.infrastructure.persistence.models import PaperRecord
+from app.infrastructure.persistence.topic_models import TopicPaperRecord
+
+
+def keyword_terms(query: str, limit: int = 20) -> list[str]:
+    """将中英文问题转换为可用于基线召回的去重词项。
+
+    :param query: 用户输入的检索问题。
+    :param limit: 最多保留的词项数量。
+    :return: 英文单词或中文双字词项的去重列表。
+    """
+    terms: list[str] = []
+    for part in re.findall(r"[a-z0-9][a-z0-9_.-]*|[\u4e00-\u9fff]+", query.lower()):
+        if "\u4e00" <= part[0] <= "\u9fff" and len(part) > 2:
+            terms.extend(part[index : index + 2] for index in range(len(part) - 1))
+        else:
+            terms.append(part)
+    return list(dict.fromkeys(terms))[:limit]
+
+
+class PostgresKeywordSearcher:
+    """使用 PostgreSQL 过滤并召回关键词片段。"""
+
+    def __init__(self, session_factory) -> None:
+        self.session_factory = session_factory
+
+    def allowed_paper_ids(self, topic_id: UUID, filters: SearchFilters) -> set[str]:
+        """查询符合专题和元数据过滤条件的论文 ID。
+
+        :param topic_id: 当前专题 ID。
+        :param filters: 日期、分类和收藏过滤条件。
+        :return: 允许进入召回阶段的论文 ID 集合。
+        """
+        statement = (
+            select(PaperRecord.paper_id)
+            .join(TopicPaperRecord, TopicPaperRecord.paper_id == PaperRecord.paper_id)
+            .where(TopicPaperRecord.topic_id == topic_id)
+        )
+        if filters.published_from is not None:
+            statement = statement.where(PaperRecord.published_at >= filters.published_from)
+        if filters.categories:
+            statement = statement.where(PaperRecord.categories.overlap(list(filters.categories)))
+        if filters.favorite_only:
+            statement = statement.where(TopicPaperRecord.is_favorite.is_(True))
+        with self.session_factory() as session:
+            return set(session.scalars(statement).all())
+
+    def paper_details(self, paper_ids: set[str]) -> dict[str, tuple[str, str, str | None]]:
+        """查询来源展示所需的论文元数据。
+
+        :param paper_ids: 要查询的论文 ID 集合。
+        :return: 从论文 ID 到标题、原文链接和 PDF 链接的映射。
+        """
+        if not paper_ids:
+            return {}
+        statement = select(
+            PaperRecord.paper_id,
+            PaperRecord.title,
+            PaperRecord.url,
+            PaperRecord.pdf_url,
+        ).where(PaperRecord.paper_id.in_(paper_ids))
+        with self.session_factory() as session:
+            rows = session.execute(statement).all()
+        return {
+            paper_id: (title, url, pdf_url)
+            for paper_id, title, url, pdf_url in rows
+        }
+
+    def search(
+        self,
+        topic_id: UUID,
+        query: str,
+        filters: SearchFilters,
+        limit: int,
+    ) -> list[RetrievalCandidate]:
+        """按词项覆盖率召回专题内的全文片段。
+
+        :param topic_id: 当前专题 ID。
+        :param query: 用户检索问题。
+        :param filters: 元数据过滤条件。
+        :param limit: 最多返回的候选数量。
+        :return: 按关键词覆盖率降序排列的候选。
+        """
+        tokens = keyword_terms(query)
+        allowed = self.allowed_paper_ids(topic_id, filters)
+        if not tokens or not allowed:
+            return []
+        details = self.paper_details(allowed)
+        statement = (
+            select(DocumentChunkRecord)
+            .where(
+                DocumentChunkRecord.topic_id == topic_id,
+                DocumentChunkRecord.paper_id.in_(allowed),
+                or_(*(DocumentChunkRecord.text.ilike(f"%{token}%") for token in tokens)),
+            )
+            .limit(limit * 4)
+        )
+        with self.session_factory() as session:
+            records = session.scalars(statement).all()
+        candidates = [
+            RetrievalCandidate(
+                paper_id=record.paper_id,
+                title=details[record.paper_id][0],
+                url=details[record.paper_id][1],
+                pdf_url=details[record.paper_id][2],
+                chunk_id=record.id,
+                section_title=record.section_title,
+                page_start=record.page_start,
+                page_end=record.page_end,
+                text=record.text,
+                keyword_score=sum(token in record.text.lower() for token in tokens) / len(tokens),
+            )
+            for record in records
+        ]
+        return sorted(candidates, key=lambda item: item.keyword_score or 0.0, reverse=True)[:limit]
+```
+
+`allowed_paper_ids()` 先应用专题、日期、分类和收藏条件；两路召回使用同一集合，避免关键词路径和向量路径得到不同的数据边界。
+
+创建 `app/application/reranking.py`。第一个可运行版本使用 Reciprocal Rank Fusion；它不需要外部模型，适合先建立稳定基线，后续可在同一端口下替换为 cross-encoder：
+
+```python
+from dataclasses import replace
+
+from app.domain.knowledge.retrieval import RetrievalCandidate
+
+
+class ReciprocalRankReranker:
+    """使用倒数排名融合语义与关键词候选。"""
+
+    def __init__(self, rank_constant: int = 60) -> None:
+        self.rank_constant = rank_constant
+
+    def rank(
+        self,
+        semantic: list[RetrievalCandidate],
+        keyword: list[RetrievalCandidate],
+        limit: int,
+    ) -> list[RetrievalCandidate]:
+        """按片段 ID 去重并计算倒数排名融合分。
+
+        :param semantic: 按向量距离排列的候选。
+        :param keyword: 按关键词分排列的候选。
+        :param limit: 最终保留数量。
+        :return: 按融合分降序排列的去重候选。
+        """
+        merged: dict[object, RetrievalCandidate] = {}
+        scores: dict[object, float] = {}
+        for candidates in (semantic, keyword):
+            for rank, candidate in enumerate(candidates, start=1):
+                previous = merged.get(candidate.chunk_id)
+                if previous is None:
+                    merged[candidate.chunk_id] = candidate
+                else:
+                    merged[candidate.chunk_id] = replace(
+                        previous,
+                        semantic_distance=(
+                            previous.semantic_distance
+                            if previous.semantic_distance is not None
+                            else candidate.semantic_distance
+                        ),
+                        keyword_score=(
+                            previous.keyword_score
+                            if previous.keyword_score is not None
+                            else candidate.keyword_score
+                        ),
+                    )
+                scores[candidate.chunk_id] = scores.get(candidate.chunk_id, 0.0) + 1 / (
+                    self.rank_constant + rank
+                )
+        ranked = [replace(item, rerank_score=scores[item.chunk_id]) for item in merged.values()]
+        return sorted(ranked, key=lambda item: item.rerank_score, reverse=True)[:limit]
+```
+
+创建 `app/application/hybrid_retrieval_service.py`，并从阶段 3 起用它替换摘要时代的 `RetrievalService`：
+
+```python
+from dataclasses import dataclass
+from uuid import UUID
+
+from app.domain.knowledge.retrieval import RetrievalCandidate, SearchFilters
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    """保存检索来源和实际使用的索引版本。"""
+
+    sources: list[RetrievalCandidate]
+    index_version: str
+
+
+class HybridRetrievalService:
+    """在统一过滤范围内融合向量与关键词候选。"""
+
+    def __init__(self, embeddings, vector_store, versions, keyword_searcher, reranker) -> None:
+        self.embeddings = embeddings
+        self.vector_store = vector_store
+        self.versions = versions
+        self.keyword_searcher = keyword_searcher
+        self.reranker = reranker
+
+    async def search(
+        self,
+        *,
+        topic_id: UUID,
+        question: str,
+        top_k: int,
+        index_version: str | None = None,
+        filters: SearchFilters | None = None,
+    ) -> SearchResult:
+        """执行专题范围内的混合检索。
+
+        :param topic_id: 当前专题 ID。
+        :param question: 用户问题。
+        :param top_k: 最终返回的来源数量。
+        :param index_version: 可选的固定索引版本。
+        :param filters: 可选的日期、分类和收藏过滤条件。
+        :return: 混合重排后的来源和实际索引版本。
+        """
+        active_filters = filters or SearchFilters()
+        version = index_version
+        if version is None:
+            ready = self.versions.get_ready(topic_id)
+            if ready is None:
+                return SearchResult([], "")
+            version = ready.version
+        allowed = self.keyword_searcher.allowed_paper_ids(topic_id, active_filters)
+        if not allowed:
+            return SearchResult([], version)
+        details = self.keyword_searcher.paper_details(allowed)
+        embedding = (await self.embeddings.embed_texts([question]))[0]
+        rows = self.vector_store.query_document_chunks(
+            embedding,
+            topic_id=topic_id,
+            index_version=version,
+            top_k=min(top_k * 5, 100),
+            paper_ids=sorted(allowed),
+        )
+        semantic = [
+            RetrievalCandidate(
+                paper_id=row["paper_id"],
+                title=details[row["paper_id"]][0],
+                url=details[row["paper_id"]][1],
+                pdf_url=details[row["paper_id"]][2],
+                chunk_id=UUID(row["chunk_id"]),
+                section_title=row["section_title"] or None,
+                page_start=int(row["page_start"]),
+                page_end=int(row["page_end"]),
+                text=row["text"],
+                semantic_distance=float(row["score"]),
+            )
+            for row in rows
+        ]
+        keyword = self.keyword_searcher.search(topic_id, question, active_filters, top_k * 5)
+        return SearchResult(self.reranker.rank(semantic, keyword, top_k), version)
+```
+
+Chroma 返回的是 cosine distance，数值越小越相似；本实现保留原始距离，但融合时只使用候选排名，避免误把距离当成“越大越好”的相关分。`paper_ids` 直接进入 Chroma 的 `where` 条件，不是先取全局 Top-N 再在内存中过滤；否则不属于当前专题的候选可能挤掉全部合法结果。
+
+### 拒答状态和模型降级
+
+用下面版本替换 `app/application/rag_service.py`。阈值来自固定评测集，不能按单个问题临时调整：
+
+```python
+from dataclasses import dataclass
+from enum import StrEnum
+from uuid import UUID
+
+from app.domain.knowledge.retrieval import RetrievalCandidate, SearchFilters
+
+
+class AnswerStatus(StrEnum):
+    """定义问答端点可解释的结果状态。"""
+
+    ANSWERED = "answered"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    GENERATION_UNAVAILABLE = "generation_unavailable"
+
+
+@dataclass(frozen=True)
+class AskResult:
+    """保存回答、来源、状态和索引版本。"""
+
+    answer: str
+    sources: list[RetrievalCandidate]
+    answer_status: AnswerStatus
+    index_version: str
+
+    @property
+    def insufficient_evidence(self) -> bool:
+        """返回结果是否因为证据不足而拒答。
+
+        :return: 状态为证据不足时返回 True。
+        """
+        return self.answer_status is AnswerStatus.INSUFFICIENT_EVIDENCE
+
+
+class RAGService:
+    """根据检索证据生成回答，并对不足或模型失败显式降级。"""
+
+    def __init__(self, retrieval, llm, min_rerank_score: float) -> None:
+        self.retrieval = retrieval
+        self.llm = llm
+        self.min_rerank_score = min_rerank_score
+
+    async def ask(
+        self,
+        *,
+        topic_id: UUID,
+        question: str,
+        top_k: int,
+        index_version: str | None = None,
+        filters: SearchFilters | None = None,
+    ) -> AskResult:
+        """检索证据并返回可解释的回答状态。
+
+        :param topic_id: 当前专题 ID。
+        :param question: 用户问题。
+        :param top_k: 最多使用的来源数量。
+        :param index_version: 可选的固定索引版本。
+        :param filters: 可选的元数据过滤条件。
+        :return: 回答、来源、状态和索引版本。
+        """
+        result = await self.retrieval.search(
+            topic_id=topic_id,
+            question=question,
+            top_k=top_k,
+            index_version=index_version,
+            filters=filters,
+        )
+        if not result.sources or result.sources[0].rerank_score < self.min_rerank_score:
+            return AskResult(
+                "证据不足，无法回答。",
+                result.sources,
+                AnswerStatus.INSUFFICIENT_EVIDENCE,
+                result.index_version,
+            )
+        try:
+            answer = await self.llm.generate(question, [source.text for source in result.sources])
+        except Exception:
+            return AskResult(
+                "已找到相关证据，但生成服务暂不可用。",
+                result.sources,
+                AnswerStatus.GENERATION_UNAVAILABLE,
+                result.index_version,
+            )
+        return AskResult(answer, result.sources, AnswerStatus.ANSWERED, result.index_version)
+```
+
+用下面内容完整替换阶段 2 的 `app/core/config.py`，避免只手工插入一个字段后遗漏 Redis 或 Provider 配置：
+
+```python
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import quote_plus
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def env(name: str, default: str = "") -> str:
+    """读取环境变量并在缺失时返回默认值。
+
+    :param name: 环境变量名称。
+    :param default: 变量缺失时使用的值。
+    :return: 环境变量值或默认值。
+    """
+    return os.getenv(name, default)
+
+
+@dataclass(frozen=True)
+class Settings:
+    """保存阶段 3 应用的全部运行配置。"""
+
+    llm_provider: str = env("LLM_PROVIDER", "mock")
+    embedding_provider: str = env("EMBEDDING_PROVIDER", "hash")
+    storage_backend: str = env("STORAGE_BACKEND", "postgres")
+    deepseek_api_key: str = env("DEEPSEEK_API_KEY")
+    deepseek_base_url: str = env("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    deepseek_model: str = env("DEEPSEEK_MODEL", "deepseek-chat")
+    siliconflow_api_key: str = env("SILICONFLOW_API_KEY")
+    siliconflow_base_url: str = env(
+        "SILICONFLOW_BASE_URL",
+        "https://api.siliconflow.cn/v1",
+    )
+    siliconflow_model: str = env(
+        "SILICONFLOW_MODEL",
+        "Qwen/Qwen2.5-72B-Instruct",
+    )
+    siliconflow_embedding_model: str = env(
+        "SILICONFLOW_EMBEDDING_MODEL",
+        "BAAI/bge-m3",
+    )
+    chroma_host: str = env("CHROMA_HOST", "127.0.0.1")
+    chroma_port: int = int(env("CHROMA_PORT", "8001"))
+    collection_name: str = env("COLLECTION_NAME", "papermind")
+    papers_file: Path = Path(env("PAPERS_FILE", "data/papers.json"))
+    postgres_host: str = env("POSTGRES_HOST", "127.0.0.1")
+    postgres_port: int = int(env("POSTGRES_PORT", "5432"))
+    postgres_db: str = env("POSTGRES_DB", "papermind")
+    postgres_user: str = env("POSTGRES_USER", "papermind")
+    postgres_password: str = env("POSTGRES_PASSWORD", "papermind")
+    redis_url: str = env("REDIS_URL", "redis://localhost:6379/0")
+    rag_min_rerank_score: float = float(env("RAG_MIN_RERANK_SCORE", "0.0"))
+
+    @property
+    def postgres_url(self) -> str:
+        """构建 psycopg 使用的 SQLAlchemy 连接地址。
+
+        :return: 显式 `POSTGRES_URL` 或由分项配置组装的地址。
+        """
+        direct_url = env("POSTGRES_URL")
+        if direct_url:
+            return direct_url
+        return (
+            "postgresql+psycopg://"
+            f"{quote_plus(self.postgres_user)}:{quote_plus(self.postgres_password)}"
+            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+        )
+```
+
+初次语义基线可暂将 `RAG_MIN_RERANK_SCORE` 设为 `0.0`，但在完成拒答评测前不能发布为默认策略；把最终阈值写入 `.env.example` 和发布记录。
+
+### HTTP 契约与阶段 3 最终装配
+
+用下面内容替换 `app/schemas/search.py`。保留 `insufficient_evidence` 是为了兼容阶段 1 前端，但其值必须由 `answer_status` 推导：
+
+```python
+from datetime import datetime
+from uuid import UUID
+
+from pydantic import BaseModel, Field
+
+from app.application.rag_service import AnswerStatus
+from app.domain.knowledge.retrieval import SearchFilters
+
+
+class SearchRequest(BaseModel):
+    """校验专题检索和问答的请求体。"""
+
+    question: str = Field(min_length=1, max_length=2000)
+    top_k: int = Field(default=5, ge=1, le=20)
+    index_version: str | None = None
+    published_from: datetime | None = None
+    categories: list[str] = Field(default_factory=list, max_length=20)
+    favorite_only: bool = False
+
+    def to_filters(self) -> SearchFilters:
+        """转换为应用层使用的不可变过滤条件。
+
+        :return: 日期、去空白分类和收藏过滤条件。
+        """
+        return SearchFilters(
+            published_from=self.published_from,
+            categories=tuple(item.strip() for item in self.categories if item.strip()),
+            favorite_only=self.favorite_only,
+        )
+
+
+class SourceResponse(BaseModel):
+    """表示可定位且保留各阶段分数的检索来源。"""
+
+    paper_id: str
+    title: str
+    url: str
+    pdf_url: str | None
+    chunk_id: UUID
+    section_title: str | None
+    page_start: int
+    page_end: int
+    text: str
+    semantic_distance: float | None
+    keyword_score: float | None
+    rerank_score: float
+
+
+class SearchResponse(BaseModel):
+    """表示混合检索响应。"""
+
+    sources: list[SourceResponse]
+    index_version: str
+
+
+class AskResponse(SearchResponse):
+    """表示带可解释状态的问答响应。"""
+
+    answer: str
+    answer_status: AnswerStatus
+    insufficient_evidence: bool
+```
+
+用下面内容替换 `app/api/v1/search.py`，确保两条路径使用完全相同的过滤条件：
+
+```python
+from uuid import UUID
+
+from fastapi import APIRouter, Depends
+
+from app.api.dependencies import get_rag_service, get_retrieval_service
+from app.schemas.search import AskResponse, SearchRequest, SearchResponse, SourceResponse
+
+
+router = APIRouter(tags=["search"])
+
+
+def source(item) -> SourceResponse:
+    """将检索候选转换为 HTTP 来源响应。
+
+    :param item: 应用层返回的检索候选。
+    :return: 保留位置和三类分数的来源响应。
+    """
+    return SourceResponse(
+        paper_id=item.paper_id,
+        title=item.title,
+        url=item.url,
+        pdf_url=item.pdf_url,
+        chunk_id=item.chunk_id,
+        section_title=item.section_title,
+        page_start=item.page_start,
+        page_end=item.page_end,
+        text=item.text,
+        semantic_distance=item.semantic_distance,
+        keyword_score=item.keyword_score,
+        rerank_score=item.rerank_score,
+    )
+
+
+@router.post("/topics/{topic_id}/search", response_model=SearchResponse)
+async def search(
+    topic_id: UUID,
+    request: SearchRequest,
+    service=Depends(get_retrieval_service),
+) -> SearchResponse:
+    """执行专题混合检索。
+
+    :param topic_id: 当前专题 ID。
+    :param request: 已校验的检索请求。
+    :param service: 注入的混合检索服务。
+    :return: 来源和实际索引版本。
+    """
+    result = await service.search(
+        topic_id=topic_id,
+        question=request.question,
+        top_k=request.top_k,
+        index_version=request.index_version,
+        filters=request.to_filters(),
+    )
+    return SearchResponse(
+        sources=[source(item) for item in result.sources],
+        index_version=result.index_version,
+    )
+
+
+@router.post("/topics/{topic_id}/ask", response_model=AskResponse)
+async def ask(
+    topic_id: UUID,
+    request: SearchRequest,
+    service=Depends(get_rag_service),
+) -> AskResponse:
+    """执行专题问答并返回可解释状态。
+
+    :param topic_id: 当前专题 ID。
+    :param request: 已校验的问答请求。
+    :param service: 注入的 RAG 服务。
+    :return: 回答、来源、状态和实际索引版本。
+    """
+    result = await service.ask(
+        topic_id=topic_id,
+        question=request.question,
+        top_k=request.top_k,
+        index_version=request.index_version,
+        filters=request.to_filters(),
+    )
+    return AskResponse(
+        answer=result.answer,
+        sources=[source(item) for item in result.sources],
+        answer_status=result.answer_status,
+        insufficient_evidence=result.insufficient_evidence,
+        index_version=result.index_version,
+    )
+```
+
+用下面内容替换阶段 2 的聚合 Router，确保全文路由真正注册：
+
+```python
+from fastapi import APIRouter
+
+from app.api.v1 import (
+    collection,
+    documents,
+    index_jobs,
+    indexing,
+    jobs,
+    search,
+    subscriptions,
+    topic_papers,
+    topics,
+)
+
+
+router = APIRouter(prefix="/api/v1")
+router.include_router(topics.router)
+router.include_router(topic_papers.router)
+router.include_router(collection.router)
+router.include_router(indexing.router)
+router.include_router(subscriptions.router)
+router.include_router(index_jobs.router)
+router.include_router(jobs.router)
+router.include_router(documents.router)
+router.include_router(search.router)
+```
+
+用下面内容完整替换阶段 2 的 `app/core/container.py`。这个版本保留专题、采集、订阅和任务装配，并加入全文、混合检索和 IndexJob worker；不需要手工合并历史片段：
+
+```python
+from uuid import UUID
+
+from app.application.collection_execution_service import CollectionExecutionService
+from app.application.collection_job_service import CollectionJobService
+from app.application.collection_service import CollectionService
+from app.application.document_service import DocumentService
+from app.application.hybrid_retrieval_service import HybridRetrievalService
+from app.application.index_execution_service import IndexExecutionService
+from app.application.index_job_service import IndexJobService
+from app.application.indexing_service import IndexingService
+from app.application.rag_service import RAGService
+from app.application.reranking import ReciprocalRankReranker
+from app.application.subscription_scheduler import SubscriptionScheduler
+from app.application.subscription_service import SubscriptionService
+from app.application.topic_paper_service import TopicPaperService
+from app.application.topic_service import TopicService
+from app.core.config import Settings
+from app.infrastructure.ai.embeddings import create_embedding_client
+from app.infrastructure.ai.llm import create_llm_client
+from app.infrastructure.arxiv.collector import collect_arxiv
+from app.infrastructure.documents.downloader import HttpPdfDownloader
+from app.infrastructure.documents.pymupdf_parser import PyMuPdfParser
+from app.infrastructure.persistence.collection_job_repository import (
+    PostgresCollectionJobRepository,
+)
+from app.infrastructure.persistence.database import session_factory
+from app.infrastructure.persistence.document_repository import (
+    PostgresChunkRepository,
+    PostgresDocumentRepository,
+)
+from app.infrastructure.persistence.index_version_repository import (
+    PostgresIndexVersionRepository,
+)
+from app.infrastructure.persistence.keyword_searcher import PostgresKeywordSearcher
+from app.infrastructure.persistence.paper_repository import PostgresPaperRepository
+from app.infrastructure.persistence.subscription_repository import (
+    PostgresIndexJobRepository,
+    PostgresSubscriptionRepository,
+)
+from app.infrastructure.persistence.topic_repository import PostgresTopicRepository
+from app.infrastructure.tasks.dispatcher import CeleryTaskDispatcher
+from app.infrastructure.vector.chroma import ChromaVectorStore
+
+
+DEFAULT_WORKSPACE_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+
+class AppContainer:
+    """在应用边界集中创建阶段 3 的生产适配器和服务。"""
+
+    def __init__(self) -> None:
+        settings = Settings()
+        self.settings = settings
+        self.session_factory = session_factory
+
+        self.topic_repository = PostgresTopicRepository(session_factory)
+        self.paper_repository = PostgresPaperRepository(session_factory)
+        self.document_repository = PostgresDocumentRepository(session_factory)
+        self.chunk_repository = PostgresChunkRepository(session_factory)
+        self.index_version_repository = PostgresIndexVersionRepository(session_factory)
+        self.collection_job_repository = PostgresCollectionJobRepository(session_factory)
+        self.subscription_repository = PostgresSubscriptionRepository(session_factory)
+        self.index_job_repository = PostgresIndexJobRepository(session_factory)
+
+        self.embeddings = create_embedding_client(settings)
+        self.llm = create_llm_client(settings)
+        self.vector_store = ChromaVectorStore(
+            settings.chroma_host,
+            settings.chroma_port,
+            settings.collection_name,
+        )
+        self.keyword_searcher = PostgresKeywordSearcher(session_factory)
+        self.reranker = ReciprocalRankReranker()
+        self.dispatcher = CeleryTaskDispatcher()
+
+        self.topic_service = TopicService(self.topic_repository, DEFAULT_WORKSPACE_ID)
+        self.topic_paper_service = TopicPaperService(
+            self.topic_repository,
+            self.paper_repository,
+        )
+        self.collection_service = CollectionService(collect_arxiv, self.paper_repository)
+        self.indexing_service = IndexingService(
+            self.paper_repository,
+            self.embeddings,
+            self.vector_store,
+        )
+        self.retrieval_service = HybridRetrievalService(
+            self.embeddings,
+            self.vector_store,
+            self.index_version_repository,
+            self.keyword_searcher,
+            self.reranker,
+        )
+        self.rag_service = RAGService(
+            self.retrieval_service,
+            self.llm,
+            settings.rag_min_rerank_score,
+        )
+
+        self.collection_job_service = CollectionJobService(
+            self.collection_job_repository,
+            self.dispatcher,
+        )
+        self.collection_execution_service = CollectionExecutionService(
+            self.collection_job_repository,
+            self.topic_repository,
+            self.paper_repository,
+            self.subscription_repository,
+            collect_arxiv,
+        )
+        self.subscription_service = SubscriptionService(
+            self.topic_repository,
+            self.subscription_repository,
+        )
+        self.index_job_service = IndexJobService(
+            self.topic_repository,
+            self.index_job_repository,
+            self.dispatcher,
+            documents=self.document_repository,
+        )
+        self.subscription_scheduler = SubscriptionScheduler(
+            self.subscription_repository,
+            self.collection_job_service,
+        )
+
+        self.document_service = DocumentService(
+            self.document_repository,
+            HttpPdfDownloader(),
+            PyMuPdfParser(),
+            self.topic_repository,
+        )
+        self.index_execution_service = IndexExecutionService(
+            self.document_repository,
+            self.document_service,
+            self.chunk_repository,
+            self.embeddings,
+            self.vector_store,
+            self.index_version_repository,
+            self.index_job_repository,
+        )
+```
+
+以下断言必须在启动 worker 前通过：
+
+```bash
+uv run python -c "from app.core.container import AppContainer; c=AppContainer(); assert c.index_execution_service and c.retrieval_service and c.rag_service"
+```
+
+前置条件：PostgreSQL、Chroma 和 Redis 已按检查、创建、验证顺序启动，`0003` 已应用，`.env` 中的连接地址可用；否则不要运行这条真实容器装配检查。
+
+### 自动化验证
+
+创建 `tests/unit/test_reranking.py`，先固定“去重但不丢原始分数”这个不变量：
+
+```python
+from dataclasses import replace
+from uuid import uuid4
+
+from app.application.reranking import ReciprocalRankReranker
+from app.domain.knowledge.retrieval import RetrievalCandidate
+
+
+def candidate(**values: object) -> RetrievalCandidate:
+    """创建包含可定位元数据的测试候选。
+
+    :param values: 要覆盖的候选字段。
+    :return: 可用于排序测试的候选。
+    """
+    defaults = {
+        "paper_id": "p1",
+        "title": "Paper One",
+        "url": "https://example.test/p1",
+        "pdf_url": "https://example.test/p1.pdf",
+        "chunk_id": uuid4(),
+        "section_title": "Methods",
+        "page_start": 3,
+        "page_end": 4,
+        "text": "evidence",
+    }
+    return RetrievalCandidate(**{**defaults, **values})
+
+
+def test_rrf_deduplicates_and_preserves_both_scores() -> None:
+    """验证两路的同一片段只返回一次。
+
+    :return: None；通过断言验证分数保留与融合顺序。
+    """
+    semantic = candidate(semantic_distance=0.12)
+    keyword = replace(semantic, semantic_distance=None, keyword_score=0.8)
+
+    result = ReciprocalRankReranker().rank([semantic], [keyword], 5)
+
+    assert len(result) == 1
+    assert result[0].semantic_distance == 0.12
+    assert result[0].keyword_score == 0.8
+    assert result[0].rerank_score > 0
+```
+
+创建 `tests/unit/test_hybrid_retrieval_service.py`，验证允许的论文 ID 真正传入向量库，而不是只在查询后过滤：
+
+```python
+from types import SimpleNamespace
+from uuid import UUID, uuid4
+
+import pytest
+
+from app.application.hybrid_retrieval_service import HybridRetrievalService
+from app.application.reranking import ReciprocalRankReranker
+from app.domain.knowledge.retrieval import SearchFilters
+
+
+class FakeEmbeddings:
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        """返回与输入数量一致的固定向量。
+
+        :param texts: 待编码的文本。
+        :return: 固定二维测试向量。
+        """
+        return [[1.0, 0.0] for _ in texts]
+
+
+class FakeVectorStore:
+    def __init__(self, chunk_id: UUID) -> None:
+        self.chunk_id = chunk_id
+        self.paper_ids: list[str] | None = None
+
+    def query_document_chunks(self, embedding, **options):
+        """记录向量过滤并返回一条全文候选。
+
+        :param embedding: 查询向量。
+        :param options: 专题、版本、数量和论文过滤。
+        :return: Chroma 适配器格式的候选列表。
+        """
+        assert embedding == [1.0, 0.0]
+        self.paper_ids = options["paper_ids"]
+        return [{
+            "paper_id": "p1",
+            "chunk_id": str(self.chunk_id),
+            "section_title": "Methods",
+            "page_start": 3,
+            "page_end": 4,
+            "text": "hybrid evidence",
+            "score": 0.1,
+        }]
+
+
+class FakeKeywords:
+    def allowed_paper_ids(self, topic_id, filters):
+        """返回符合专题与元数据过滤的论文。
+
+        :param topic_id: 专题 ID。
+        :param filters: 元数据过滤。
+        :return: 唯一允许的论文 ID。
+        """
+        return {"p1"}
+
+    def paper_details(self, paper_ids):
+        """返回来源展示元数据。
+
+        :param paper_ids: 待查询论文 ID。
+        :return: 标题、原文链接和 PDF 链接。
+        """
+        assert paper_ids == {"p1"}
+        return {"p1": ("Paper One", "https://example.test/p1", None)}
+
+    def search(self, topic_id, query, filters, limit):
+        """返回空关键词候选以隔离向量过滤测试。
+
+        :param topic_id: 专题 ID。
+        :param query: 检索问题。
+        :param filters: 元数据过滤。
+        :param limit: 候选上限。
+        :return: 空候选列表。
+        """
+        return []
+
+
+@pytest.mark.asyncio
+async def test_allowed_papers_are_applied_inside_vector_query() -> None:
+    """验证向量查询使用与关键词查询相同的论文边界。
+
+    :return: None；通过断言验证向量过滤与来源元数据。
+    """
+    vector_store = FakeVectorStore(uuid4())
+    service = HybridRetrievalService(
+        FakeEmbeddings(),
+        vector_store,
+        SimpleNamespace(get_ready=lambda topic_id: SimpleNamespace(version="v1")),
+        FakeKeywords(),
+        ReciprocalRankReranker(),
+    )
+
+    result = await service.search(
+        topic_id=uuid4(),
+        question="使用什么研究方法",
+        top_k=5,
+        filters=SearchFilters(categories=("cs.CL",)),
+    )
+
+    assert vector_store.paper_ids == ["p1"]
+    assert result.sources[0].title == "Paper One"
+    assert result.sources[0].section_title == "Methods"
+```
+
+创建 `tests/unit/test_rag_service.py` 的阶段 3 完整替换版本：
+
+```python
+from types import SimpleNamespace
+from uuid import uuid4
+
+import pytest
+
+from app.application.rag_service import AnswerStatus, RAGService
+from app.domain.knowledge.retrieval import RetrievalCandidate
+
+
+def source(score: float) -> RetrievalCandidate:
+    """创建具有指定重排分的测试来源。
+
+    :param score: 最终重排分。
+    :return: 可定位的测试来源。
+    """
+    return RetrievalCandidate(
+        paper_id="p1",
+        title="Paper One",
+        url="https://example.test/p1",
+        pdf_url=None,
+        chunk_id=uuid4(),
+        section_title="Methods",
+        page_start=3,
+        page_end=4,
+        text="evidence",
+        rerank_score=score,
+    )
+
+
+class FakeRetrieval:
+    def __init__(self, evidence: list[RetrievalCandidate]) -> None:
+        self.evidence = evidence
+
+    async def search(self, **options):
+        """返回预置的检索来源。
+
+        :param options: RAG 服务传入的检索参数。
+        :return: 带固定索引版本的检索结果。
+        """
+        return SimpleNamespace(sources=self.evidence, index_version="v1")
+
+
+class FailingLLM:
+    calls = 0
+
+    async def generate(self, question: str, contexts: list[str]) -> str:
+        """记录调用并模拟模型服务故障。
+
+        :param question: 用户问题。
+        :param contexts: 检索证据。
+        :return: 本 Fake 不会正常返回。
+        :raises RuntimeError: 每次调用都抛出。
+        """
+        self.calls += 1
+        raise RuntimeError("provider unavailable")
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_keeps_sources() -> None:
+    """验证模型故障不会丢失已检索证据。
+
+    :return: None；通过断言验证降级状态与来源。
+    """
+    llm = FailingLLM()
+    result = await RAGService(FakeRetrieval([source(0.03)]), llm, 0.02).ask(
+        topic_id=uuid4(),
+        question="question",
+        top_k=5,
+    )
+
+    assert result.answer_status is AnswerStatus.GENERATION_UNAVAILABLE
+    assert len(result.sources) == 1
+    assert llm.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_low_score_refuses_without_calling_model() -> None:
+    """验证低于阈值时在生成前拒答。
+
+    :return: None；通过断言验证拒答状态与零模型调用。
+    """
+    llm = FailingLLM()
+    result = await RAGService(FakeRetrieval([source(0.01)]), llm, 0.02).ask(
+        topic_id=uuid4(),
+        question="question",
+        top_k=5,
+    )
+
+    assert result.answer_status is AnswerStatus.INSUFFICIENT_EVIDENCE
+    assert len(result.sources) == 1
+    assert llm.calls == 0
+```
+
+创建 `tests/integration/test_keyword_searcher.py`。该测试用一个外层事务回滚数据，且不得用 SQLite 代替，因为 `ARRAY.overlap` 是 PostgreSQL 行为：
+
+```python
+import os
+from datetime import UTC, datetime
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+
+from app.domain.knowledge.retrieval import SearchFilters
+from app.infrastructure.persistence.keyword_searcher import PostgresKeywordSearcher
+
+
+@pytest.mark.integration
+def test_metadata_filters_limit_keyword_candidates() -> None:
+    """验证日期、分类和收藏条件同时约束关键词召回。
+
+    :return: None；通过断言验证 PostgreSQL 过滤与中文词项召回。
+    """
+    engine = create_engine(os.environ["PAPER_MIND_TEST_POSTGRES_URL"])
+    connection = engine.connect()
+    transaction = connection.begin()
+    try:
+        workspace_id = uuid4()
+        topic_id = uuid4()
+        document_id = uuid4()
+        chunk_id = uuid4()
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name) VALUES (:id, :name)"
+            ),
+            {"id": workspace_id, "name": f"workspace-{workspace_id}"},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO topics
+                    (id, workspace_id, name, description, keywords, categories)
+                VALUES
+                    (:id, :workspace_id, :name, '', ARRAY['研究方法'], ARRAY['cs.CL'])
+                """
+            ),
+            {"id": topic_id, "workspace_id": workspace_id, "name": f"topic-{topic_id}"},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO papers
+                    (paper_id, title, abstract, authors, url, pdf_url,
+                     published_at, parse_status, categories)
+                VALUES
+                    ('p-allowed', 'Allowed', '', '[]'::json,
+                     'https://example.test/allowed', NULL,
+                     '2026-01-02T00:00:00+00:00', 'parsed', ARRAY['cs.CL']),
+                    ('p-excluded', 'Excluded', '', '[]'::json,
+                     'https://example.test/excluded', NULL,
+                     '2020-01-02T00:00:00+00:00', 'parsed', ARRAY['cs.CV'])
+                """
+            )
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO topic_papers (topic_id, paper_id, is_favorite)
+                VALUES (:topic_id, 'p-allowed', true),
+                       (:topic_id, 'p-excluded', false)
+                """
+            ),
+            {"topic_id": topic_id},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO documents (id, paper_id, source_url, file_path, status)
+                VALUES (:id, 'p-allowed', 'https://example.test/allowed.pdf',
+                        '/tmp/allowed.pdf', 'parsed')
+                """
+            ),
+            {"id": document_id},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO document_chunks
+                    (id, document_id, paper_id, topic_id, chunk_index, text,
+                     section_title, page_start, page_end, chunker_version)
+                VALUES
+                    (:id, :document_id, 'p-allowed', :topic_id, 0,
+                     '该论文使用实验研究方法', 'Methods', 3, 4, 'v1')
+                """
+            ),
+            {"id": chunk_id, "document_id": document_id, "topic_id": topic_id},
+        )
+        factory = sessionmaker(bind=connection, expire_on_commit=False)
+        searcher = PostgresKeywordSearcher(factory)
+
+        result = searcher.search(
+            topic_id,
+            "使用什么研究方法",
+            SearchFilters(
+                published_from=datetime(2025, 1, 1, tzinfo=UTC),
+                categories=("cs.CL",),
+                favorite_only=True,
+            ),
+            limit=5,
+        )
+
+        assert [item.chunk_id for item in result] == [chunk_id]
+        assert result[0].title == "Allowed"
+        assert result[0].keyword_score is not None
+    finally:
+        transaction.rollback()
+        connection.close()
+        engine.dispose()
+```
+
+该文件依赖 `0003` 已在专用测试库完成；如果环境变量缺失，应在运行测试前失败，不要把必须的集成检查静默跳过。再以同一固定数据集分别运行向量基线和混合策略，输出 Recall@K、MRR、nDCG、拒答正确率、P95 延迟和模型调用次数。
+
+创建 `evaluation/metrics.py`，让核心排序指标使用同一实现：
+
+```python
+import math
+
+
+def recall_at_k(ranked_ids: list[str], relevant_ids: set[str], k: int) -> float:
+    """计算前 K 个结果覆盖的相关项比例。
+
+    :param ranked_ids: 按检索顺序排列的结果 ID。
+    :param relevant_ids: 标注为相关的 ID 集合。
+    :param k: 评估截断位置。
+    :return: Recall@K；没有相关标注时返回 0。
+    """
+    if not relevant_ids:
+        return 0.0
+    return len(set(ranked_ids[:k]) & relevant_ids) / len(relevant_ids)
+
+
+def reciprocal_rank(ranked_ids: list[str], relevant_ids: set[str]) -> float:
+    """计算第一个相关结果的倒数排名。
+
+    :param ranked_ids: 按检索顺序排列的结果 ID。
+    :param relevant_ids: 标注为相关的 ID 集合。
+    :return: 第一个相关结果的倒数排名；未命中时返回 0。
+    """
+    for rank, item_id in enumerate(ranked_ids, start=1):
+        if item_id in relevant_ids:
+            return 1 / rank
+    return 0.0
+
+
+def ndcg_at_k(ranked_ids: list[str], relevant_ids: set[str], k: int) -> float:
+    """计算二元相关标注下的 nDCG@K。
+
+    :param ranked_ids: 按检索顺序排列的结果 ID。
+    :param relevant_ids: 标注为相关的 ID 集合。
+    :param k: 评估截断位置。
+    :return: 归一化折损累计增益；没有相关标注时返回 0。
+    """
+    gains = [1.0 if item_id in relevant_ids else 0.0 for item_id in ranked_ids[:k]]
+    dcg = sum(gain / math.log2(rank + 1) for rank, gain in enumerate(gains, start=1))
+    ideal_length = min(len(relevant_ids), k)
+    if ideal_length == 0:
+        return 0.0
+    ideal = sum(1 / math.log2(rank + 1) for rank in range(1, ideal_length + 1))
+    return dcg / ideal
+
+
+def citation_precision(predicted_chunk_ids: list[str], allowed_chunk_ids: set[str]) -> float:
+    """计算回答引用中属于允许证据范围的比例。
+
+    :param predicted_chunk_ids: 回答实际引用的片段 ID。
+    :param allowed_chunk_ids: 标注或检索阶段允许引用的片段 ID。
+    :return: 引用正确率；没有引用时返回 0。
+    """
+    if not predicted_chunk_ids:
+        return 0.0
+    return sum(item_id in allowed_chunk_ids for item_id in predicted_chunk_ids) / len(
+        predicted_chunk_ids
+    )
+```
+
+用下面内容完整替换本阶段前文的 `evaluation/scripts/run_retrieval_eval.py`：
+
+```python
+import argparse
+import json
+import math
+import time
+from pathlib import Path
+from typing import Any
+
+import httpx
+
+from evaluation.metrics import (
+    citation_precision,
+    ndcg_at_k,
+    recall_at_k,
+    reciprocal_rank,
+)
+
+
+def mean(values: list[float]) -> float | None:
+    """计算可能为空的指标列表均值。
+
+    :param values: 单样本指标值。
+    :return: 算术平均值；列表为空时返回 None。
+    """
+    return sum(values) / len(values) if values else None
+
+
+def percentile_95(values: list[float]) -> float | None:
+    """计算小样本也可使用的最近排名 P95。
+
+    :param values: 以毫秒为单位的耗时列表。
+    :return: P95 耗时；列表为空时返回 None。
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)]
+
+
+def post_json(
+    client: httpx.Client,
+    path: str,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], float]:
+    """调用 PaperMind API 并记录端到端耗时。
+
+    :param client: 带 API 基础地址的 HTTP 客户端。
+    :param path: API 相对路径。
+    :param payload: JSON 请求体。
+    :return: JSON 响应和毫秒耗时。
+    :raises httpx.HTTPStatusError: API 返回非成功状态时抛出。
+    """
+    started = time.perf_counter()
+    response = client.post(path, json=payload)
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    response.raise_for_status()
+    return response.json(), elapsed_ms
+
+
+def main() -> None:
+    """运行固定数据集的检索、引用和拒答评测。
+
+    :return: None；将机器可读报告输出到标准输出和可选文件。
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--api-base", default="http://127.0.0.1:8000")
+    parser.add_argument("--topic-id", required=True)
+    parser.add_argument("--index-version", required=True)
+    parser.add_argument("--strategy", default="hybrid-rrf")
+    parser.add_argument(
+        "--dataset",
+        default="evaluation/datasets/disinformation_v1.jsonl",
+    )
+    parser.add_argument("--output")
+    args = parser.parse_args()
+
+    dataset_path = Path(args.dataset)
+    dataset = [
+        json.loads(line)
+        for line in dataset_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    metrics: dict[str, list[float]] = {
+        "recall_at_5": [],
+        "mrr": [],
+        "ndcg_at_5": [],
+        "citation_precision": [],
+        "abstention_accuracy": [],
+    }
+    latencies_ms: list[float] = []
+    failures: list[str] = []
+    model_calls = 0
+
+    with httpx.Client(base_url=args.api_base.rstrip("/"), timeout=60.0) as client:
+        for item in dataset:
+            payload = {
+                "question": item["question"],
+                "top_k": 5,
+                "index_version": args.index_version,
+            }
+            search, search_ms = post_json(
+                client,
+                f"/api/v1/topics/{args.topic_id}/search",
+                payload,
+            )
+            answer, answer_ms = post_json(
+                client,
+                f"/api/v1/topics/{args.topic_id}/ask",
+                payload,
+            )
+            latencies_ms.extend([search_ms, answer_ms])
+            ranked_chunk_ids = [str(source["chunk_id"]) for source in search["sources"]]
+            answer_chunk_ids = [str(source["chunk_id"]) for source in answer["sources"]]
+            relevant = set(item["relevant_chunk_ids"])
+
+            if item["expected_behavior"] == "retrieve":
+                metrics["recall_at_5"].append(recall_at_k(ranked_chunk_ids, relevant, 5))
+                metrics["mrr"].append(reciprocal_rank(ranked_chunk_ids, relevant))
+                metrics["ndcg_at_5"].append(ndcg_at_k(ranked_chunk_ids, relevant, 5))
+                metrics["citation_precision"].append(
+                    citation_precision(answer_chunk_ids, relevant)
+                )
+                passed = answer["answer_status"] == "answered" and bool(
+                    set(answer_chunk_ids) & relevant
+                )
+            elif item["expected_behavior"] == "abstain":
+                passed = answer["answer_status"] == "insufficient_evidence"
+                metrics["abstention_accuracy"].append(float(passed))
+            else:
+                raise ValueError(
+                    f"unknown expected_behavior: {item['expected_behavior']}"
+                )
+
+            if answer["answer_status"] in {"answered", "generation_unavailable"}:
+                model_calls += 1
+            if not passed:
+                failures.append(item["query_id"])
+
+    report = {
+        "dataset": str(dataset_path),
+        "dataset_version": dataset_path.stem,
+        "topic_id": args.topic_id,
+        "index_version": args.index_version,
+        "strategy": args.strategy,
+        **{name: mean(values) for name, values in metrics.items()},
+        "p95_latency_ms": percentile_95(latencies_ms),
+        "model_calls": model_calls,
+        "sample_count": len(dataset),
+        "failure_query_ids": failures,
+    }
+    rendered = json.dumps(report, ensure_ascii=False, indent=2)
+    print(rendered)
+    if args.output:
+        output = Path(args.output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(rendered + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+脚本对每条检索样本记录 Recall@K、MRR、nDCG 和引用正确性，对拒答样本记录 `answer_status` 是否为 `insufficient_evidence`；同时记录 HTTP 耗时、推定的模型调用次数和失败样本 ID。评测集中的 `relevant_chunk_ids` 必须在构建固定索引后由人工核对并替换成真实 UUID；`chunk-001` 之类示例值不得用于发布门禁。
+
+前置条件：上述领域、Repository、Service、Router、Container 和测试均已保存；单元/API 测试使用 Fake，PostgreSQL 测试使用可丢弃数据库。满足后运行：
+
+```bash
+uv run pytest tests/unit/test_reranking.py tests/unit/test_hybrid_retrieval_service.py tests/unit/test_rag_service.py tests/api/test_search.py -q
+PAPER_MIND_TEST_POSTGRES_URL=<可丢弃的数据库 URL> uv run pytest tests/integration/test_keyword_searcher.py -m integration -q
+```
+
+### 前端：显示全文来源、章节与拒答状态
+
+用下面内容完整替换阶段 1 的 `frontend-web/src/api/topics.ts`。阶段 5 会在此基础上加入阅读状态，阶段 3 不提前声明该字段：
+
+```ts
+export type Topic = {
+  id: string;
+  name: string;
+  description: string;
+  keywords: string[];
+  categories: string[];
+};
+
+export type TopicPaper = {
+  paper_id: string;
+  title?: string;
+  authors?: string[];
+  url?: string;
+  pdf_url?: string;
+  is_favorite: boolean;
+};
+
+export type Source = {
+  paper_id: string;
+  title: string;
+  url: string;
+  pdf_url?: string;
+  chunk_id: string;
+  section_title?: string;
+  page_start: number;
+  page_end: number;
+  text: string;
+  semantic_distance?: number;
+  keyword_score?: number;
+  rerank_score: number;
+};
+
+export type Answer = {
+  answer: string;
+  answer_status: "answered" | "insufficient_evidence" | "generation_unavailable";
+  insufficient_evidence: boolean;
+  sources: Source[];
+  index_version: string;
+};
+
+const baseUrl = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${baseUrl}${path}`, {
+    headers: { "Content-Type": "application/json", ...init?.headers },
+    ...init,
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as {
+      detail?: string;
+      title?: string;
+    } | null;
+    throw new Error(body?.detail ?? body?.title ?? `请求失败（${response.status}）`);
+  }
+  return response.status === 204
+    ? (undefined as T)
+    : response.json() as Promise<T>;
+}
+
+export function listTopics(): Promise<{ items: Topic[] }> {
+  return request("/api/v1/topics");
+}
+
+export function createTopic(
+  input: Pick<Topic, "name" | "description" | "keywords" | "categories">,
+): Promise<Topic> {
+  return request("/api/v1/topics", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export function getTopic(topicId: string): Promise<Topic> {
+  return request(`/api/v1/topics/${topicId}`);
+}
+
+export function listTopicPapers(topicId: string): Promise<{ items: TopicPaper[] }> {
+  return request(`/api/v1/topics/${topicId}/papers`);
+}
+
+export function setFavorite(
+  topicId: string,
+  paperId: string,
+  isFavorite: boolean,
+): Promise<TopicPaper> {
+  return request(`/api/v1/topics/${topicId}/papers/${encodeURIComponent(paperId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ is_favorite: isFavorite }),
+  });
+}
+
+export function searchTopic(
+  topicId: string,
+  question: string,
+): Promise<{ sources: Source[]; index_version: string }> {
+  return request(`/api/v1/topics/${topicId}/search`, {
+    method: "POST",
+    body: JSON.stringify({ question }),
+  });
+}
+
+export function askTopic(topicId: string, question: string): Promise<Answer> {
+  return request(`/api/v1/topics/${topicId}/ask`, {
+    method: "POST",
+    body: JSON.stringify({ question }),
+  });
+}
+```
+
+用下面内容完整替换 `frontend-web/src/components/SourceList.tsx`：
+
+```tsx
+import { Source } from "../api/topics";
+
+export function SourceList({ sources }: { sources: Source[] }) {
+  if (sources.length === 0) return <p>没有可定位的来源。</p>;
+  return <ol>{sources.map((source) => <li key={source.chunk_id}>
+    <a href={source.pdf_url ?? source.url} target="_blank" rel="noreferrer">
+      {source.title}
+    </a>
+    <span>，{source.section_title ?? "未识别章节"}，第 {source.page_start}–{source.page_end} 页</span>
+    <blockquote>{source.text}</blockquote>
+  </li>)}</ol>;
+}
+```
+
+用下面内容完整替换 `frontend-web/src/components/SearchPanel.tsx`。检索和问答仍分别发起请求，因此可以分别观察召回来源和实际回答来源；模型不可用时保留来源而不是把它伪装成拒答：
+
+```tsx
+import { FormEvent, useState } from "react";
+
+import { Answer, askTopic, searchTopic, Source } from "../api/topics";
+import { SourceList } from "./SourceList";
+
+
+const statusMessages: Record<Answer["answer_status"], string> = {
+  answered: "回答已基于下列来源生成。",
+  insufficient_evidence: "当前专题的证据不足，系统没有调用模型生成结论。",
+  generation_unavailable: "已检索到下列证据，但模型服务暂不可用。",
+};
+
+
+export function SearchPanel({ topicId }: { topicId: string }) {
+  const [question, setQuestion] = useState("");
+  const [sources, setSources] = useState<Source[]>([]);
+  const [answer, setAnswer] = useState<Answer | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setError("");
+    setLoading(true);
+    try {
+      const [search, nextAnswer] = await Promise.all([
+        searchTopic(topicId, question),
+        askTopic(topicId, question),
+      ]);
+      setSources(search.sources);
+      setAnswer(nextAnswer);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "检索失败");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return <section>
+    <h2>专题内检索与问答</h2>
+    <form onSubmit={submit}>
+      <input
+        value={question}
+        onChange={(event) => setQuestion(event.target.value)}
+        placeholder="输入研究问题"
+        required
+      />
+      <button disabled={loading} type="submit">
+        {loading ? "正在检索…" : "检索并提问"}
+      </button>
+    </form>
+    {error && <p role="alert">{error}</p>}
+    {answer && <>
+      <h3>回答</h3>
+      <p>{answer.answer}</p>
+      <p role="status">{statusMessages[answer.answer_status]}</p>
+      <p>索引版本：{answer.index_version || "尚无 ready 索引"}</p>
+    </>}
+    <SourceList sources={sources} />
+  </section>;
+}
+```
+
+## 阶段 3 文件收口清单
+
+- 新增全文链路：`app/domain/documents/`、`app/infrastructure/documents/`、`app/application/document_service.py`、`index_execution_service.py`、`app/infrastructure/persistence/document_models.py`、`document_repository.py`、`index_version_models.py`、`index_version_repository.py`。
+- 新增混合检索：`app/domain/knowledge/retrieval.py`、`app/infrastructure/persistence/keyword_searcher.py`、`app/application/reranking.py`、`hybrid_retrieval_service.py`。
+- 新增 HTTP、任务和评测：`app/schemas/documents.py`、`search.py`、`app/api/v1/documents.py`、`search.py`、`app/infrastructure/tasks/index_tasks.py`、`evaluation/metrics.py`、`evaluation/scripts/run_retrieval_eval.py` 和固定数据集。
+- 新增数据库与测试：`migrations/versions/0003_documents_and_evaluations.py` 及本阶段列出的 unit/API/integration 测试。
+- 完整替换：`app/domain/models.py`、`app/infrastructure/persistence/models.py`、`job_models.py`、`app/infrastructure/arxiv/collector.py`、`app/domain/knowledge/chunking.py`、`app/infrastructure/vector/chroma.py`、`app/application/rag_service.py`、`app/core/config.py`、`container.py`、`app/api/v1/router.py`、任务注册与 dispatcher。
+- 停止注册：阶段 1 的 `app/api/v1/knowledge.py`；保留文件作学习对照，实际 `/search` 与 `/ask` 只由 `app/api/v1/search.py` 提供。
+
+前置条件：所有文件已保存，`0003` 已应用到可丢弃数据库，PostgreSQL、Redis 和 Chroma 已验证，评测集中的片段 ID 已换成固定索引的真实标注。满足后运行：
+
+```bash
+uv run ruff format app tests evaluation
+uv run ruff format --check app tests evaluation
+uv run ruff check app tests evaluation
+POSTGRES_URL=<可丢弃的数据库 URL> uv run alembic upgrade head
+uv run pytest tests/unit tests/api -q
+PAPER_MIND_TEST_POSTGRES_URL=<可丢弃的数据库 URL> uv run pytest -m integration -q
+uv run python evaluation/scripts/run_retrieval_eval.py \
+  --topic-id <专题 UUID> \
+  --index-version <ready 索引版本>
+npm --prefix frontend-web run lint
+npm --prefix frontend-web run build
+```
+
+全部通过且评测报告达到本阶段门槛后，才进入阶段 4。
